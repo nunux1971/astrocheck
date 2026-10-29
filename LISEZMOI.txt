@@ -1,17 +1,39 @@
-fitsview — visionneuse pour trier ses brutes FITS, RAW Canon (CR2) et vidéos SER
-================================================================================
+AstroCheck — contrôle et tri des nuits d'astrophotographie
+(FITS, RAW Canon CR2, vidéos SER, darks, flats et offsets)
+Anciennement « fitsview ».
+=============================================================================
 
 Contenu de l'archive
-  fitsview.py    le programme
-  fitsview.svg   l'icône (vectorielle)
-  fitsview.png   l'icône (256 x 256)
-  installer.sh   installe fitsview dans le menu des applications
-  NOTICE.md      la notice d'utilisation complète
+  astrocheck.py             le programme
+  astrocheck.svg / .png     l'icône
+  installer_astrocheck.sh   installe AstroCheck (menu + commande « astrocheck »)
+  desinstaller_fitsview.sh  retire l'ancienne version fitsview
+  NOTICE.md                 la notice d'utilisation complète
 
-Démarrage rapide (Debian, Ubuntu, Mint)
-  sudo apt install python3-pyqt5 python3-numpy python3-astropy
+Vous aviez fitsview ?
+  sh desinstaller_fitsview.sh
+  sh installer_astrocheck.sh
+  (vos réglages sont repris, vos images ne sont jamais touchées)
+
+Première installation (Debian, Ubuntu, Mint)
+  sudo apt install python3-pyqt6 python3-numpy python3-astropy
   sudo apt install dcraw   # seulement pour lire les fichiers CR2
-  sh installer.sh          # ajoute fitsview au menu
-  ./fitsview.py            # ou lancer directement sans installer
+  sh installer_astrocheck.sh
 
-Pour désinstaller : sh installer.sh --retirer
+Nouveau dans cette version : PyQt6
+  AstroCheck utilise maintenant PyQt6 au lieu de PyQt5 :
+  sudo apt install python3-pyqt6
+
+Raccourcis principaux
+  Ctrl+R      analyser, classer et présélectionner les brutes
+  G           graphique de la nuit
+  C           vue des coins (inclinaison, courbure de champ)
+  Ctrl+K      vérifier darks, flats et offsets
+  Ctrl+Maj+K  contrôle détaillé des darks (pose, gain, température)
+  Ctrl+U      rotation de champ et zone utile après empilement
+  Z           afficher la zone utile sur l'image
+  Ctrl+Maj+R  choisir l'image affichée comme référence
+  Ctrl+Maj+Début  première image comme référence (comme le Dwarf 3)
+  Ctrl+Maj+S  exporter vers PixInsight ou Siril
+
+Pour désinstaller AstroCheck : sh installer_astrocheck.sh --retirer
