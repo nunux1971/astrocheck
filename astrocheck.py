@@ -89,14 +89,15 @@ def set_align(item, col, flag):
     except TypeError:
         item.setTextAlignment(*args[:-1], int(flag.value))
 
-COLUMNS = ["Image", "N°", "Type", "Temp.", "Score", "FWHM", "Excent.",
-           "Rot.", "Étoiles", "Fond", "Netteté", "Raison"]
-(COL_NAME, COL_NUM, COL_TYPE, COL_TEMP, COL_SCORE, COL_FWHM, COL_ECC,
- COL_ROT, COL_STARS, COL_BG, COL_SHARP, COL_REASON) = range(len(COLUMNS))
+COLUMNS = ["Image", "N°", "Type", "Temp.", "Haut.", "Score", "FWHM",
+           "Excent.", "Rot.", "Étoiles", "Fond", "Netteté", "Raison"]
+(COL_NAME, COL_NUM, COL_TYPE, COL_TEMP, COL_ALT, COL_SCORE, COL_FWHM,
+ COL_ECC, COL_ROT, COL_STARS, COL_BG, COL_SHARP, COL_REASON) = \
+    range(len(COLUMNS))
 LEFT_COLUMNS = (COL_NAME, COL_TYPE, COL_REASON)
 
 # libellés courts de la colonne Raison
-REASON_SHORT = {"dark": "dark non conforme", "fwhm": "flou", "ecc": "étoiles allongées",
+REASON_SHORT = {"dark": "dark non conforme", "flatbad": "flat non conforme", "fwhm": "flou", "ecc": "étoiles allongées",
                 "stars": "peu d'étoiles", "bg": "fond élevé",
                 "none": "aucune étoile", "sharp": "netteté"}
 
@@ -784,6 +785,145 @@ def pixel_scale(header):
     return 206.265 * pix / foc      # XPIXSZ inclut déjà le binning (norme)
 
 
+def box_mean(a, k):
+    """Moyenne glissante k × k (k impair), bords compris."""
+    r = k // 2
+    p = np.pad(a, r, mode="edge").astype(np.float64)
+    c = p.cumsum(0).cumsum(1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+    return (s / (k * k)).astype(np.float32)
+
+
+def detect_trail(resid, noise):
+    """Cherche une traînée rectiligne (satellite, avion, météore).
+    resid : image moins le fond ; noise : bruit par pixel.
+    Renvoie {"angle", "length", "line": (x0, y0, x1, y1)} en pixels de
+    resid, ou None."""
+    h, w = resid.shape
+    f = max(1, int(np.ceil(max(h, w) / 900.0)))
+    hh, ww = h // f, w // f
+    d = resid[:hh * f, :ww * f].reshape(hh, f, ww, f).mean(axis=(1, 3))
+    sig = noise / f
+    hp = d - box_mean(d, 15)                 # retire nébuleuses et halos
+    mask = hp > 3.0 * sig
+    # les étoiles : petits amas très brillants, on les efface largement
+    bright = hp > 25.0 * sig
+    if bright.any():
+        grow = box_mean(bright.astype(np.float32), 7) > 0
+        mask &= ~grow
+    ys, xs = np.nonzero(mask)
+    if len(ys) < 30:
+        return None
+    rng = np.random.default_rng(0)
+    if len(ys) > 40000:
+        pick = rng.choice(len(ys), 40000, replace=False)
+        ys, xs = ys[pick], xs[pick]
+    thetas = np.radians(np.arange(0, 180, 1.0))
+    diag = int(np.hypot(hh, ww)) + 2
+    nr = diag  # 2 px par case de rho, de -diag à +diag
+    ct, st = np.cos(thetas), np.sin(thetas)
+    rho = (xs[:, None] * ct[None, :] + ys[:, None] * st[None, :])
+    ri = np.round((rho + diag) / 2.0).astype(np.int64)
+    idx = ri + np.arange(len(thetas))[None, :] * (nr + 1)
+    acc = np.bincount(idx.ravel(), minlength=len(thetas) * (nr + 1))
+    acc = acc.reshape(len(thetas), nr + 1)
+    best = None
+    min_len = max(40.0, 0.2 * min(hh, ww))
+    flat = np.argsort(acc.ravel())[::-1][:12]
+    for k in flat:
+        ti, rj = divmod(int(k), nr + 1)
+        if acc[ti, rj] < min_len * 0.5:
+            break
+        th = thetas[ti]
+        r0 = rj * 2.0 - diag
+        c, s_ = np.cos(th), np.sin(th)
+        # affinage : droite des moindres carrés sur les points proches
+        for tol in (4.0, 2.0, 1.5):
+            dist = xs * c + ys * s_ - r0
+            near = np.abs(dist) < tol
+            if near.sum() < 10:
+                break
+            px0, py0 = xs[near].mean(), ys[near].mean()
+            cov = np.cov(np.vstack([xs[near] - px0, ys[near] - py0]))
+            evals, evecs = np.linalg.eigh(cov)
+            nx, ny = evecs[:, 0]             # normale = plus petit axe
+            c, s_ = nx, ny
+            r0 = px0 * c + py0 * s_
+        x_c, y_c = r0 * c, r0 * s_
+        dx, dy = -s_, c
+        t = np.arange(-diag, diag, 1.0)
+        px_, py_ = x_c + t * dx, y_c + t * dy
+        inside = (px_ >= 4) & (px_ < ww - 4) & (py_ >= 4) & (py_ < hh - 4)
+        if inside.sum() < min_len:
+            continue
+        t, px_, py_ = t[inside], px_[inside], py_[inside]
+        on = np.max([hp[np.round(py_ + o * s_).astype(int).clip(0, hh - 1),
+                        np.round(px_ + o * c).astype(int).clip(0, ww - 1)]
+                     for o in (-1, 0, 1)], axis=0)
+        # contraste avec deux bandes parallèles à 4 px de part et d'autre
+        offs = []
+        for o in (-4, 4):
+            qx = np.round(px_ + o * c).astype(int).clip(0, ww - 1)
+            qy = np.round(py_ + o * s_).astype(int).clip(0, hh - 1)
+            offs.append(hp[qy, qx])
+        side = np.maximum(offs[0], offs[1])
+        lit = (on > 2.5 * sig) & (on - side > 2.0 * sig)
+        # plus long tronçon allumé, trous de 3 px tolérés
+        run, best_run, gap, start, best_span = 0, 0, 0, 0, (0, 0)
+        for i, v in enumerate(lit):
+            if v:
+                if run == 0:
+                    start = i
+                run, gap = i - start + 1, 0
+                if run > best_run:
+                    best_run, best_span = run, (start, i)
+            elif run:
+                gap += 1
+                if gap > 3:
+                    run, gap = 0, 0
+        if best_run < min_len:
+            continue
+        a, b = best_span
+        frac = lit[a:b + 1].mean()
+        if frac < 0.6:
+            continue
+        # aigrette de diffraction : la ligne passe par le cœur d'une étoile
+        # brillante situé vers son milieu
+        core = np.zeros(len(px_), bool)
+        for o in (-2, -1, 0, 1, 2):
+            core |= bright[np.round(py_ + o * s_).astype(int).clip(0, hh - 1),
+                           np.round(px_ + o * c).astype(int).clip(0, ww - 1)]
+        margin = int(0.05 * (b - a)) + 3
+        lo_, hi_ = max(0, a - margin), min(len(core) - 1, b + margin)
+        hits = np.nonzero(core[lo_:hi_ + 1])[0] + lo_
+        spike = False
+        if len(hits):
+            # un groupe de points brillants consécutifs = une étoile
+            groups = np.split(hits, np.nonzero(np.diff(hits) > 2)[0] + 1)
+            idx_ = np.arange(a, b + 1)
+            seg = on[a:b + 1]
+            for g in groups:
+                dist = np.abs(idx_ - g.mean())
+                dmax = max(dist.max(), 1)
+                near_ = seg[dist <= 0.2 * dmax]
+                far_ = seg[dist >= 0.6 * dmax]
+                if len(near_) and len(far_) and \
+                        np.median(near_) > 2.0 * max(np.median(far_), sig):
+                    spike = True         # s'éteint en s'éloignant du cœur
+                    break
+        if spike:
+            continue
+        if best is None or best_run > best[0]:
+            best = (best_run, (px_[a] * f, py_[a] * f, px_[b] * f, py_[b] * f))
+    if best is None:
+        return None
+    x0, y0, x1, y1 = best[1]
+    ang = float(np.degrees(np.arctan2(y1 - y0, x1 - x0)) % 180.0)
+    return {"angle": ang, "length": float(np.hypot(x1 - x0, y1 - y0)),
+            "line": (float(x0), float(y0), float(x1), float(y1))}
+
+
 def measure_data(data, header):
     """Mesure une image (float32 2D ou HxWx3). Renvoie un dict."""
     scale = 1
@@ -852,12 +992,22 @@ def measure_data(data, header):
     signal = float(np.percentile(subsample(sm), 99.5))
     sharp = float(np.mean(lap * lap)) / max(signal, noise) ** 2
 
+    try:
+        trail = detect_trail(resid_full, noise)
+    except Exception:   # noqa: BLE001  (la mesure principale reste valable)
+        trail = None
+    if trail:
+        x0, y0, x1, y1 = trail["line"]
+        trail = {"angle": trail["angle"], "length": trail["length"] * scale,
+                 "line": tuple(v * scale for v in (x0, y0, x1, y1))}
+
     enough = len(fwhms) >= 3
     grid = [[(iq_mean([z[0] for z in zone]) * scale,
               iq_mean([z[1] for z in zone]), len(zone))
              if len(zone) >= 3 else None for zone in row] for row in zones]
     return {
         "grid": grid,                       # (FWHM, excentricité, n) par zone
+        "trail": trail,                     # traînée de satellite ou d'avion
         # étoiles les plus brillantes (x, y) en pixels du fichier
         "stars_xy": np.array(stars_xy, dtype=np.float32).reshape(-1, 2),
         "shape": (int(data.shape[1]), int(data.shape[0])),     # (w, h)
@@ -924,6 +1074,12 @@ def compute_scores(measures):
     return {k: (100.0 * v / best if best > 0 else 0.0) for k, v in raw.items()}
 
 
+def pct(x, sign=False):
+    """Pourcentage à la française : 25 %, +3 %."""
+    v = round(100 * x)
+    return (f"{v:+d}" if sign else f"{v:d}") + "\u202f%"
+
+
 def fr(x, nd=1):
     return f"{x:.{nd}f}".replace(".", ",")
 
@@ -942,6 +1098,8 @@ def reason_kind(reason):
         return "sharp"
     if reason.startswith("dark"):
         return "dark"
+    if reason.startswith("flat :"):
+        return "flatbad"
     return "stars"
 
 
@@ -1158,6 +1316,191 @@ def detect_type(imagetyp, path):
     return "light"
 
 
+# ----------------------------------------------------------------------------
+# Position de l'objet dans le ciel
+# ----------------------------------------------------------------------------
+
+def parse_angle(v, hours=False):
+    """Angle en degrés depuis un nombre ou une chaîne sexagésimale
+    (« 22 47 21.5 », « +58:07:12 »). hours : la chaîne est en heures."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    txt = str(v).strip()
+    try:
+        return float(txt)
+    except ValueError:
+        pass
+    parts = re.findall(r"[-+]?\d+(?:\.\d+)?", txt.replace(",", "."))
+    if not parts:
+        return None
+    sign = -1.0 if txt.lstrip().startswith("-") else 1.0
+    vals = [abs(float(x)) for x in parts[:3]]
+    deg = vals[0] + (vals[1] / 60 if len(vals) > 1 else 0) \
+        + (vals[2] / 3600 if len(vals) > 2 else 0)
+    return sign * deg * (15.0 if hours else 1.0)
+
+
+def alt_az(ra, dec, lat, lon, utc):
+    """Hauteur et azimut (degrés, azimut compté du nord vers l'est) d'un
+    objet (ra, dec en degrés) vu depuis (lat, lon est positive) à la date
+    UTC donnée."""
+    jd = (utc - datetime(2000, 1, 1, 12)).total_seconds() / 86400.0
+    gmst = (280.46061837 + 360.98564736629 * jd) % 360.0
+    ha = np.radians((gmst + lon - ra) % 360.0)
+    d, f = np.radians(dec), np.radians(lat)
+    sin_alt = np.sin(f) * np.sin(d) + np.cos(f) * np.cos(d) * np.cos(ha)
+    alt = np.arcsin(np.clip(sin_alt, -1, 1))
+    az = np.arctan2(-np.sin(ha) * np.cos(d),
+                    np.cos(f) * np.sin(d) - np.sin(f) * np.cos(d) * np.cos(ha))
+    return float(np.degrees(alt)), float(np.degrees(az) % 360.0)
+
+
+SIDEREAL_DEG_H = 15.041           # rotation de la Terre, degrés par heure
+
+
+def rotation_rate_theory(lat, alt, az):
+    """Vitesse de rotation du champ (°/h) pour une monture alt-azimutale."""
+    ca = np.cos(np.radians(alt))
+    if ca < 0.02:
+        return None                        # au zénith : indéfinie
+    return float(SIDEREAL_DEG_H * np.cos(np.radians(lat))
+                 * np.cos(np.radians(az)) / ca)
+
+
+
+# ----------------------------------------------------------------------------
+# Bilan de la séance
+# ----------------------------------------------------------------------------
+
+def hm(seconds):
+    """Durée lisible : 2 h 05 min, 12 min, 45 s."""
+    seconds = int(round(seconds or 0))
+    if seconds < 60:
+        return f"{seconds} s"
+    h, mn = divmod(seconds // 60, 60)
+    return f"{h} h {mn:02d} min" if h else f"{mn} min"
+
+
+def night_of(date):
+    """Nuit d'observation : une image de 2 h du matin appartient à la nuit
+    commencée la veille."""
+    return (date - timedelta(hours=12)).date() if date else None
+
+
+def rejection_cost(rows):
+    """Ce que coûte le tri : temps de pose perdu, perte de rapport
+    signal/bruit et gain en finesse. rows : dicts avec exp, fwhm, kept."""
+    tot = sum(r.get("exp") or 0 for r in rows)
+    kept = sum(r.get("exp") or 0 for r in rows if r["kept"])
+    n, nk = len(rows), sum(1 for r in rows if r["kept"])
+    out = {"n": n, "kept": nk, "exp_total": tot, "exp_kept": kept}
+    if tot > 0:
+        out["time_lost"] = 1.0 - kept / tot
+        out["snr_loss"] = 1.0 - float(np.sqrt(kept / tot))
+    elif n:
+        out["time_lost"] = 1.0 - nk / n
+        out["snr_loss"] = 1.0 - float(np.sqrt(nk / n))
+    f_all = _median([r.get("fwhm") for r in rows])
+    f_kept = _median([r.get("fwhm") for r in rows if r["kept"]])
+    if f_all and f_kept:
+        out["fwhm_all"], out["fwhm_kept"] = f_all, f_kept
+        out["fwhm_gain"] = 1.0 - f_kept / f_all
+    return out
+
+
+def focus_drift(rows):
+    """Lien entre la FWHM et la température du capteur (dérive de mise au
+    point), corrigé de la hauteur de l'objet quand on la connaît.
+    Renvoie None si les données ne suffisent pas."""
+    pts = [r for r in rows if r["kept"] and r.get("fwhm")
+           and r.get("temp") is not None]
+    if len(pts) < 10:
+        return None
+    t = np.array([r["temp"] for r in pts], float)
+    f = np.array([r["fwhm"] for r in pts], float)
+    if t.max() - t.min() < 1.5:
+        return {"range": float(t.max() - t.min()), "n": len(pts),
+                "enough": False}
+    cols = [np.ones_like(t), t]
+    use_alt = all(r.get("alt") and r["alt"] > 5 for r in pts)
+    if use_alt:
+        airmass = np.array([1.0 / np.sin(np.radians(r["alt"])) for r in pts])
+        if airmass.max() - airmass.min() > 0.05:
+            cols.append(airmass)
+        else:
+            use_alt = False
+    A = np.vstack(cols).T
+    coef, *_ = np.linalg.lstsq(A, f, rcond=None)
+    pred = A @ coef
+    ss_res = float(((f - pred) ** 2).sum())
+    ss_tot = float(((f - f.mean()) ** 2).sum()) or 1e-12
+    r_t = float(np.corrcoef(t, f)[0, 1]) if t.std() > 0 and f.std() > 0 \
+        else 0.0
+    med = float(np.median(f))
+    slope = float(coef[1]) / med           # fraction de FWHM par °C
+    out = {"n": len(pts), "enough": True, "range": float(t.max() - t.min()),
+           "t_min": float(t.min()), "t_max": float(t.max()),
+           "slope": slope, "r": r_t, "r2": 1.0 - ss_res / ss_tot,
+           "with_alt": use_alt}
+    # significatif : corrélation nette et effet de plus de 1 % par degré
+    out["significant"] = abs(r_t) >= 0.5 and abs(slope) >= 0.01
+    if out["significant"] and slope < 0:
+        out["refocus_every"] = 0.05 / -slope   # °C pour perdre 5 % de FWHM
+    return out
+
+
+def nights_summary(rows):
+    """Statistiques par nuit."""
+    by = OrderedDict()
+    for r in sorted(rows, key=lambda r: (r.get("date") is None,
+                                         r.get("date") or datetime.min)):
+        by.setdefault(night_of(r.get("date")), []).append(r)
+    out = []
+    for night, rs in by.items():
+        kept = [r for r in rs if r["kept"]]
+        temps = [r["temp"] for r in rs if r.get("temp") is not None]
+        alts = [r["alt"] for r in rs if r.get("alt") is not None]
+        dates = [r["date"] for r in rs if r.get("date")]
+        out.append({
+            "night": night, "n": len(rs), "kept": len(kept),
+            "exp_kept": sum(r.get("exp") or 0 for r in kept),
+            "fwhm": _median([r.get("fwhm") for r in kept]),
+            "bg": _median([r.get("bg") for r in kept]),
+            "temps": (min(temps), max(temps)) if temps else None,
+            "alts": (min(alts), max(alts)) if alts else None,
+            "span": (min(dates), max(dates)) if dates else None,
+            "trails": sum(1 for r in rs if r.get("trail"))})
+    return out
+
+
+def slow_exposure_windows(rows, lat, fwhm, halfdiag, exptime):
+    """Moments où la rotation théorique allonge les étoiles des coins de
+    plus d'une demi-FWHM pendant une pose. Renvoie [(début, fin, max °/h)]."""
+    if not (fwhm and halfdiag and exptime):
+        return []
+    bad = []
+    for r in sorted((r for r in rows if r.get("alt") is not None
+                     and r.get("date")), key=lambda r: r["date"]):
+        rate = rotation_rate_theory(lat, r["alt"], r["az"])
+        if rate is None:
+            continue
+        trail = np.radians(abs(rate)) / 3600.0 * exptime * halfdiag
+        bad.append((r["date"], trail > 0.5 * fwhm, abs(rate)))
+    out, cur = [], None
+    for date, flag, rate in bad:
+        if flag:
+            cur = [date, date, rate] if cur is None else \
+                [cur[0], date, max(cur[2], rate)]
+        elif cur is not None:
+            out.append(tuple(cur))
+            cur = None
+    if cur is not None:
+        out.append(tuple(cur))
+    return out
+
+
 def utc_to_local(dt):
     """Date UTC (sans fuseau) -> heure locale de l'ordinateur."""
     if dt is None:
@@ -1221,7 +1564,22 @@ def read_meta(path):
         if n1 and n2:
             meta["size"] = (int(n1), int(n2))
         meta["bayer"] = str(h.get("BAYERPAT", "") or "").strip().upper()
-        meta["date"] = utc_to_local(parse_date_obs(h))   # DATE-OBS est en UTC
+        utc = parse_date_obs(h)
+        meta["date_utc"] = utc
+        meta["date"] = utc_to_local(utc)                  # DATE-OBS est en UTC
+        meta["camera"] = str(h.get("CAMERA", "") or "").strip()
+        meta["instrument"] = str(h.get("INSTRUME", "") or "").strip()
+        meta["object"] = str(h.get("OBJECT", "") or "").strip()
+        meta["ra"] = parse_angle(h.get("RA"))
+        if meta["ra"] is None:
+            meta["ra"] = parse_angle(h.get("OBJCTRA"), hours=True)
+        meta["dec"] = parse_angle(h.get("DEC"))
+        if meta["dec"] is None:
+            meta["dec"] = parse_angle(h.get("OBJCTDEC"))
+        meta["site_lat"] = parse_angle(h.get("SITELAT") or h.get("OBSLAT")
+                                       or h.get("LAT-OBS"))
+        meta["site_lon"] = parse_angle(h.get("SITELONG") or h.get("OBSLONG")
+                                       or h.get("LONG-OBS"))
     except Exception:   # noqa: BLE001  (fichier abîmé : on garde le défaut)
         meta["type"] = detect_type("", path)
     # ce que l'en-tête ne dit pas, le nom du fichier ou du dossier le dit
@@ -1396,6 +1754,102 @@ def _same(a, b, rel=0.02):
     return abs(a - b) <= rel * max(abs(a), abs(b), 1e-9) + 1e-9
 
 
+FLAT_MIN_COUNT = 20
+
+
+def flat_stats(data, bitpix):
+    """Niveau, saturation, vignetage et motif réduit d'un flat."""
+    a = np.asarray(data, dtype=np.float32)
+    if a.ndim == 3:
+        a = a.mean(axis=0 if a.shape[0] == 3 else 2)
+    full = 255.0 if bitpix == 8 else 65535.0
+    s = subsample(a, 400_000)
+    med = float(np.median(s))
+    sat = float(np.mean(s >= 0.98 * full))
+    h, w = a.shape
+    # motif réduit 24 × 36 (moyennes de blocs), normalisé
+    bh, bw = max(1, h // 24), max(1, w // 36)
+    small = a[:bh * 24, :bw * 36].reshape(24, bh, 36, bw).mean(axis=(1, 3))
+    norm = small / max(float(np.median(small)), 1e-6)
+    centre = float(norm[9:15, 14:22].mean())
+    corners = float(np.mean([norm[:3, :3].mean(), norm[:3, -3:].mean(),
+                             norm[-3:, :3].mean(), norm[-3:, -3:].mean()]))
+    return {"median": med, "level": med / full, "sat": sat,
+            "vignetting": 1.0 - corners / max(centre, 1e-6), "pattern": norm}
+
+
+def flat_control(flats, stats, lights=()):
+    """Verdict pour chaque flat. flats : [(source, meta)] ;
+    stats : {source: flat_stats} ; lights : [(source, meta)] des brutes.
+    Renvoie (verdicts {source: (niveau, texte)}, conseils)."""
+    verdicts, advice = {}, []
+    measured = [s for s, _ in flats if s in stats]
+    # motif de référence : médiane des flats de même taille
+    shapes = {}
+    for s in measured:
+        shapes.setdefault(stats[s]["pattern"].shape, []).append(s)
+    odd = {}
+    for srcs in shapes.values():
+        if len(srcs) < 3:
+            continue
+        ref = np.median([stats[s]["pattern"] for s in srcs], axis=0)
+        diffs = {s: float(np.sqrt(np.mean((stats[s]["pattern"] - ref) ** 2)))
+                 for s in srcs}
+        med_d = float(np.median(list(diffs.values())))
+        spread = float(1.4826 * np.median([abs(d - med_d)
+                                           for d in diffs.values()]))
+        lim = max(med_d + 6 * spread, 0.01)
+        for s, d in diffs.items():
+            if d > lim:
+                odd[s] = d
+    levels = [stats[s]["median"] for s in measured]
+    med_level = float(np.median(levels)) if levels else None
+    lf = {m.get("filter") for _, m in lights if m.get("filter")}
+    for s, m in flats:
+        st = stats.get(s)
+        if st is None:
+            verdicts[s] = ("info", "non mesuré")
+            continue
+        if lf and m.get("filter") and m["filter"] not in lf:
+            verdicts[s] = ("bad", f"filtre {m['filter']} (brutes : "
+                                  f"{', '.join(sorted(lf))})")
+        elif st["sat"] > 0.005:
+            verdicts[s] = ("bad", f"saturé ({fr(100 * st['sat'], 1)} % des "
+                                  f"pixels)")
+        elif st["level"] > 0.85:
+            verdicts[s] = ("bad", f"trop clair ({pct(st['level'])} de la "
+                                  f"dynamique)")
+        elif st["level"] < 0.08:
+            verdicts[s] = ("bad", f"trop sombre ({pct(st['level'])} de la "
+                                  f"dynamique)")
+        elif s in odd:
+            verdicts[s] = ("bad", "motif différent des autres flats "
+                                  "(filtre, poussière déplacée, caméra "
+                                  "tournée ?)")
+        elif med_level and abs(st["median"] - med_level) > 0.3 * med_level:
+            verdicts[s] = ("warn", f"niveau {st['median']:.0f} très différent"
+                                   f" des autres ({med_level:.0f})")
+        elif st["level"] < 0.2 or st["level"] > 0.7:
+            verdicts[s] = ("warn", f"niveau {pct(st['level'])} : visez 30 à "
+                                   f"60 % de la dynamique")
+        else:
+            verdicts[s] = ("ok", "conforme")
+    n_ok = sum(1 for v in verdicts.values() if v[0] in ("ok", "warn"))
+    if flats and n_ok < FLAT_MIN_COUNT:
+        advice.append(f"{n_ok} flat(s) utilisables : visez "
+                      f"{FLAT_MIN_COUNT} à 30 flats pour un master propre.")
+    if any(v[0] == "bad" for v in verdicts.values()):
+        advice.append("Les flats non conformes peuvent être rejetés : ils "
+                      "fausseraient la correction du vignetage et des "
+                      "poussières.")
+    vig = [stats[s]["vignetting"] for s in measured]
+    if vig:
+        advice.append(f"Vignetage mesuré : les coins reçoivent "
+                      f"{pct(float(np.median(vig)))} de lumière en moins que "
+                      f"le centre.")
+    return verdicts, advice
+
+
 def dark_control(lights, darks, tol=2.0, stats=None):
     """Contrôle des darks face aux brutes.
     lights, darks : [(source, meta)] ; stats : {source: (médiane, bruit)}.
@@ -1473,7 +1927,7 @@ def dark_control(lights, darks, tol=2.0, stats=None):
         if not comp:
             verdict = ("bad", "aucun dark compatible")
         elif cover is not None and cover < 0.999:
-            verdict = ("warn", f"températures couvertes à {cover:.0%}")
+            verdict = ("warn", f"températures couvertes à {pct(cover)}")
         elif len(comp) < DARK_MIN_COUNT:
             verdict = ("warn", f"peu de darks ({len(comp)}) : visez "
                                f"{DARK_MIN_COUNT} à 20 ou plus")
@@ -2070,6 +2524,25 @@ def export_files(out_dir, srcs, progress=None, link=False, raw_to_fits=False,
     return created
 
 
+WEIGHT_KEY = "ACWEIGHT"
+
+
+def write_weight(path, weight):
+    """Écrit le poids AstroCheck (0 à 1) dans l'en-tête d'une COPIE FITS.
+    Jamais dans un lien (cela modifierait l'original) ni un .gz."""
+    if os.path.islink(path) or \
+            not path.lower().endswith((".fit", ".fits", ".fts")):
+        return False
+    try:
+        with fits.open(path, mode="update", memmap=False,
+                       do_not_scale_image_data=True) as hdul:
+            hdul[0].header[WEIGHT_KEY] = (round(float(weight), 4),
+                                          "AstroCheck quality weight (0-1)")
+        return True
+    except Exception:   # noqa: BLE001
+        return False
+
+
 def export_size(srcs, link=False, raw_to_fits=False):
     """Estimation de la place disque nécessaire (octets)."""
     total = 0
@@ -2221,10 +2694,10 @@ class NightGraph(QWidget):
         self.current = None
         self._hits = []
 
-    def set_data(self, entries, limits, planet, rot=None):
+    def set_data(self, entries, limits, planet, rot=None, alt=None):
         """entries : [(source, date ou None, mesures, état, nom)] ;
         rot : {source: rotation du champ en degrés}."""
-        rot = rot or {}
+        rot, alt = rot or {}, alt or {}
         if planet:
             self.panels = [("sharp", "Netteté (%)", 0), ("bg", "Fond", 0)]
         else:
@@ -2232,23 +2705,45 @@ class NightGraph(QWidget):
                            ("stars", "Étoiles", 0), ("bg", "Fond", 0)]
             if rot:
                 self.panels.append(("rot", "Rotation (°)", 1))
+        if alt:
+            self.panels.append(("alt", "Hauteur (°)", 0))
         self.limits = {}
         for k, (med, lim, _sense) in ((k, v) for k, v in limits.items()
                                       if k != "mode"):
             self.limits[k] = (med, lim)
         med_sh = limits.get("sharp", (None,))[0] if planet else None
         self.time_axis = bool(entries) and all(e[1] for e in entries)
+        self.segments = []      # nuits : (x début, x fin, date de début)
+        self.seg_of = {}
         if self.time_axis:
             entries = sorted(entries, key=lambda e: e[1])
             self.t0 = entries[0][1]
+            # une coupure de plus de 3 h sépare deux nuits
+            starts = [0] + [k for k in range(1, len(entries))
+                            if (entries[k][1] - entries[k - 1][1])
+                            > timedelta(hours=3)]
+            bounds = list(zip(starts, starts[1:] + [len(entries)]))
+            lengths = [(entries[b - 1][1] - entries[a][1]).total_seconds()
+                       / 60.0 for a, b in bounds]
+            gap = max(10.0, 0.04 * sum(lengths))
+            off = 0.0
+            for (a, b), ln in zip(bounds, lengths):
+                self.segments.append((off, off + ln, entries[a][1]))
+                for e in entries[a:b]:
+                    self.seg_of[e[0]] = len(self.segments) - 1
+                off += ln + gap
         else:
             entries = sorted(entries, key=lambda e: (e[4], e[0]))
         self.points = []
         for i, (src, date, m, state, name) in enumerate(entries):
-            x = ((date - self.t0).total_seconds() / 60.0
-                 if self.time_axis else float(i + 1))
+            if self.time_axis:
+                x0_, _x1, t_start = self.segments[self.seg_of[src]]
+                x = x0_ + (date - t_start).total_seconds() / 60.0
+            else:
+                x = float(i + 1)
             vals = {k: m.get(k) for k in ("fwhm", "ecc", "stars", "bg")}
             vals["rot"] = rot.get(src)
+            vals["alt"] = alt.get(src)
             if planet and med_sh:
                 vals["sharp"] = 100.0 * m["sharp"] / med_sh
             self.points.append((src, x, vals, state, name))
@@ -2341,11 +2836,14 @@ class NightGraph(QWidget):
             # tracé
             line = QPen(QColor(fg.red(), fg.green(), fg.blue(), 45), 1)
             p.setPen(line)
-            prev = None
+            prev, prev_seg = None, None
             for pt in self.points:
                 v = pt[2].get(key)
-                if v is None:
+                seg = self.seg_of.get(pt[0])
+                if v is None or seg != prev_seg:
                     prev = None
+                prev_seg = seg
+                if v is None:
                     continue
                 cur = QPointF(px(pt[1]), py(v))
                 if prev is not None:
@@ -2369,7 +2867,34 @@ class NightGraph(QWidget):
             p.drawLine(QPointF(cur_x, T), QPointF(cur_x, H - B))
         # axe horizontal
         p.setPen(QColor(fg.red(), fg.green(), fg.blue(), 170))
-        if self.time_axis:
+        if self.time_axis and len(self.segments) > 1:
+            total = x1 - x0
+            for k, (sa, sb, t_start) in enumerate(self.segments):
+                share = max(1, int(8 * (sb - sa + 1) / total))
+                step = next((s_ for s_ in (5, 10, 15, 30, 60, 120, 240)
+                             if (sb - sa) / s_ <= share), 480)
+                day0 = t_start.replace(hour=0, minute=0, second=0,
+                                       microsecond=0)
+                off = (t_start - day0).total_seconds() / 60.0 - sa
+                a = -(-(sa + off) // step) * step
+                p.setPen(QColor(fg.red(), fg.green(), fg.blue(), 170))
+                while a - off <= sb:
+                    t = day0 + timedelta(minutes=a)
+                    p.drawText(QRectF(px(a - off) - 30, H - B + 4, 60, 16),
+                               Qt.AlignmentFlag.AlignHCenter,
+                               t.strftime("%H:%M"))
+                    a += step
+                night = (t_start - timedelta(hours=12)).strftime("%d/%m")
+                p.drawText(QRectF(px(sa), T - 16, 160, 14),
+                           Qt.AlignmentFlag.AlignLeft,
+                           f"nuit du {night}")
+                if k:
+                    p.setPen(QPen(QColor(fg.red(), fg.green(), fg.blue(), 90),
+                                  1, Qt.PenStyle.DashLine))
+                    xs_ = (px(self.segments[k - 1][1]) + px(sa)) / 2
+                    p.drawLine(QPointF(xs_, T), QPointF(xs_, H - B))
+            p.setPen(QColor(fg.red(), fg.green(), fg.blue(), 170))
+        elif self.time_axis:
             total = x1 - x0
             step = next((s_ for s_ in (5, 10, 15, 30, 60, 120, 240)
                          if total / s_ <= 8), 480)
@@ -2392,7 +2917,7 @@ class NightGraph(QWidget):
         items = (("kept", "gardée"), ("auto", "présélection"),
                  ("manual", "rejet manuel"))
         x = W - R - sum(fm.horizontalAdvance(lbl) + 26 for _, lbl in items)
-        if self.time_axis:
+        if self.time_axis and len(self.segments) < 2:
             p.setPen(QColor(fg.red(), fg.green(), fg.blue(), 150))
             p.drawText(QRectF(L, 3, 200, T - 4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        "heure locale")
@@ -2436,6 +2961,7 @@ class FileList(QTreeWidget):
         self.setHeaderLabels(COLUMNS)
         self.setColumnHidden(COL_SHARP, True)    # affichée en planétaire
         self.setColumnHidden(COL_ROT, True)      # affichée si le champ tourne
+        self.setColumnHidden(COL_ALT, True)      # affichée si on la connaît
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setRootIsDecorated(False)
         self.setUniformRowHeights(True)        # rapide avec un long SER
@@ -2447,7 +2973,8 @@ class FileList(QTreeWidget):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
             if c not in LEFT_COLUMNS:
                 set_align(self.headerItem(), c, ALIGN_RIGHT)
-        for c, w in ((COL_NUM, 50), (COL_TYPE, 70), (COL_TEMP, 54), (COL_SCORE, 58),
+        for c, w in ((COL_NUM, 50), (COL_TYPE, 70), (COL_TEMP, 54),
+                     (COL_ALT, 50), (COL_SCORE, 58),
                      (COL_FWHM, 52), (COL_ECC, 56), (COL_ROT, 56),
                      (COL_STARS, 58), (COL_BG, 62), (COL_SHARP, 62),
                      (COL_REASON, 150)):
@@ -2459,6 +2986,9 @@ class FileList(QTreeWidget):
                          "change ni avec l'analyse ni avec le tri",
                 COL_TEMP: "Température du capteur en °C (en-tête FITS : "
                           "CCD-TEMP, DET-TEMP…, ou nom du fichier)",
+                COL_ALT: "Hauteur de l'objet au-dessus de l'horizon, en "
+                         "degrés, au moment de la pose (d'après RA, DEC, la "
+                         "date et le lieu d'observation)",
                 COL_ROT: "Rotation du champ par rapport à l'image de "
                          "référence, en degrés (monture alt-azimutale)",
                 COL_SCORE: "Qualité globale des brutes, 100 = image de "
@@ -2631,6 +3161,17 @@ class ExportDialog(QDialog):
             "Les autres images restent dans l'ordre de prise de vue.")
         self.cb_num.setEnabled(has_ref)
         bl.addWidget(self.cb_num)
+        self.cb_weight = QCheckBox(
+            f"Écrire le score de chaque brute dans les copies "
+            f"(mot-clé {WEIGHT_KEY}, de 0 à 1)")
+        self.cb_weight.setToolTip(
+            "Pour pondérer l'empilement par la qualité mesurée par AstroCheck.\n"
+            "PixInsight, ImageIntegration : Weights = FITS keyword, "
+            f"Weight keyword = {WEIGHT_KEY}.\n"
+            "Seulement avec « Copier les fichiers » : les originaux ne sont "
+            "jamais modifiés.")
+        self.cb_weight.setVisible(has_measures)
+        bl.addWidget(self.cb_weight)
         self.cb_csv = QCheckBox("Joindre le tableau des mesures (mesures.csv)")
         self.cb_csv.setVisible(has_measures)
         bl.addWidget(self.cb_csv)
@@ -2694,6 +3235,8 @@ class ExportDialog(QDialog):
          else self.rb_copy).setChecked(True)
         self.cb_raw.setChecked(setting_bool("export/raw_to_fits", False))
         self.cb_csv.setChecked(setting_bool("export/csv", True))
+        self.cb_weight.setChecked(setting_bool("export/weight", False))
+        self.rb_link.toggled.connect(self._sync)
         self.cb_script.setChecked(setting_bool("export/script", True))
         self.cb_run.setChecked(setting_bool("export/run_siril", False)
                                and bool(self.siril_cmd))
@@ -2713,6 +3256,7 @@ class ExportDialog(QDialog):
         self.adjustSize()
 
     def _sync(self, *_):
+        self.cb_weight.setEnabled(not self.rb_link.isChecked())
         structure = self.cb_lights.isChecked()
         self.cb_script.setEnabled(structure)
         self.cb_run.setEnabled(bool(self.siril_cmd) and structure
@@ -2737,6 +3281,8 @@ class ExportDialog(QDialog):
             "raw_to_fits": self.cb_raw.isChecked() and self.has_raw,
             "numbered": self.cb_num.isChecked() and self.has_ref,
             "csv": self.cb_csv.isChecked() and self.has_measures,
+            "weight": self.cb_weight.isChecked() and self.has_measures
+            and not self.rb_link.isChecked(),
             "script": siril and self.cb_script.isChecked()
             and self.cb_lights.isChecked(),
             "run": siril and self.cb_run.isEnabled() and self.cb_run.isChecked(),
@@ -2748,6 +3294,7 @@ class ExportDialog(QDialog):
         st.setValue("export/link", o["link"])
         st.setValue("export/raw_to_fits", self.cb_raw.isChecked())
         st.setValue("export/csv", self.cb_csv.isChecked())
+        st.setValue("export/weight", self.cb_weight.isChecked())
         st.setValue("export/script", self.cb_script.isChecked())
         st.setValue("export/run_siril", self.cb_run.isChecked())
         st.setValue("export/narrow", o["narrow"])
@@ -3011,6 +3558,7 @@ class MainWindow(QMainWindow):
         self.zone_dirty = True
         self._geom_key = None
         self._dark_stats = {}        # source -> (médiane, bruit) des darks
+        self._flat_stats = {}        # source -> mesures des flats
 
         self._build_ui()
         self._build_menus()
@@ -3042,6 +3590,22 @@ class MainWindow(QMainWindow):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
         lv.setSpacing(0)
+        self.series_label_w = QLabel("Série :")
+        self.series_box = QComboBox()
+        self.series_box.setToolTip(
+            "Plusieurs séries de brutes (caméra TELE ou WIDE du Dwarf, "
+            "filtre, pose, gain) : l'analyse, la présélection, la référence "
+            "et l'export portent sur la série choisie")
+        self.series_box.currentIndexChanged.connect(self.on_series_selected)
+        self.series_box.hide()
+        self.series_label_w.hide()
+        self.series_keys = []
+        self.active_series = None
+        srow = QHBoxLayout()
+        srow.setContentsMargins(0, 0, 0, 4)
+        srow.addWidget(self.series_label_w)
+        srow.addWidget(self.series_box, 1)
+        lv.addLayout(srow)
         self.type_tabs = QTabBar()
         self.type_tabs.setExpanding(False)
         self.type_tabs.setDrawBase(False)
@@ -3176,13 +3740,18 @@ class MainWindow(QMainWindow):
         self._action(m, "Revenir à la référence automatique",
                      self.reset_reference)
         m.addSeparator()
+        self._action(m, "Bilan de la séance…", self.show_session_report,
+                     "Ctrl+B")
         self._action(m, "Rotation de champ et zone utile…",
                      self.show_geometry_report, "Ctrl+U")
+        self._action(m, "Lieu d'observation…", self.site_dialog)
         m.addSeparator()
         self._action(m, "Vérifier les fichiers de calibration…",
                      self.show_calibration_check, "Ctrl+K")
         self._action(m, "Contrôle des darks…", self.show_dark_control,
                      "Ctrl+Shift+K")
+        self._action(m, "Contrôle des flats…", self.show_flat_control,
+                     "Ctrl+Shift+F")
         m.addSeparator()
         self._action(m, "Enregistrer les mesures (CSV)…", self.save_csv)
 
@@ -3247,6 +3816,87 @@ class MainWindow(QMainWindow):
     def all_items(self):
         return [self.list.item(i) for i in range(self.list.count())]
 
+    # --- séries (caméra, filtre, pose, gain) ---------------------------------
+
+    @staticmethod
+    def series_key(meta):
+        """Une série = mêmes caméra, filtre, pose, gain et binning : ses
+        brutes se comparent et s'empilent ensemble."""
+        meta = meta or {}
+        return (meta.get("camera") or meta.get("instrument") or "",
+                meta.get("filter") or "", meta.get("exptime"),
+                meta.get("gain"), meta.get("binning") or "")
+
+    @staticmethod
+    def series_label(key, n=None):
+        cam, filt, exp, gain, binning = key
+        parts = [x for x in (cam, filt) if x]
+        if exp is not None:
+            parts.append(f"{_fs(exp)} s")
+        if gain is not None:
+            parts.append(f"gain {fr(gain, 0)}")
+        if binning and binning != "1x1":
+            parts.append(f"bin {binning}")
+        text = " · ".join(parts) or "série sans en-tête"
+        return text + (f"  ({n})" if n is not None else "")
+
+    def in_work(self, it):
+        """Vrai si la ligne fait partie du travail en cours : toutes les
+        calibrations, et les brutes de la série choisie."""
+        if self.active_series is None or self.item_type(it) != "light":
+            return True
+        return self.series_key(it.data(0, ROLE_META)) == self.active_series
+
+    def working_items(self):
+        return [it for it in self.all_items() if self.in_work(it)]
+
+    def update_series_box(self):
+        counts = {}
+        for it in self.all_items():
+            if self.item_type(it) == "light":
+                k = self.series_key(it.data(0, ROLE_META))
+                counts[k] = counts.get(k, 0) + 1
+        keys = sorted(counts, key=lambda k: (-counts[k], str(k)))
+        if len(keys) < 2:
+            changed = self.active_series is not None
+            self.series_keys, self.active_series = keys, None
+            self.series_box.hide()
+            self.series_label_w.hide()
+            if changed:
+                self.series_changed()
+            return
+        active = self.active_series if self.active_series in keys else keys[0]
+        self.series_box.blockSignals(True)
+        self.series_box.clear()
+        for k in keys:
+            self.series_box.addItem(self.series_label(k, counts[k]))
+        self.series_keys = keys
+        self.series_box.setCurrentIndex(keys.index(active))
+        self.series_box.blockSignals(False)
+        self.series_box.show()
+        self.series_label_w.show()
+        if active != self.active_series:
+            self.active_series = active
+            self.series_changed()
+
+    def on_series_selected(self, index):
+        if 0 <= index < len(self.series_keys) and \
+                self.series_keys[index] != self.active_series:
+            self.active_series = self.series_keys[index]
+            self.series_changed()
+            self.statusBar().showMessage(
+                "Série : " + self.series_label(self.active_series), 6000)
+
+    def series_changed(self):
+        """Classement, présélection, référence et graphique ne portent que
+        sur la série choisie."""
+        self.apply_type_filter()
+        self._geom_key = None
+        if self.measures:
+            self.update_scores()
+        self.refresh_graph()
+        self.redisplay()
+
     def _add_item(self, src, text, meta):
         item = ImageItem([text])
         item.setData(0, ROLE_SRC, src)
@@ -3261,11 +3911,103 @@ class MainWindow(QMainWindow):
         t = meta.get("temp")
         item.setText(COL_TEMP, "" if t is None else fr(t, 1))
         item.setData(COL_TEMP, ROLE_SORT, t)
+        self.fill_altitude(item)
         for c in range(1, len(COLUMNS)):
             if c not in LEFT_COLUMNS:
                 set_align(item, c, ALIGN_RIGHT)
         self.list.addItem(item)
         self.update_item(item)
+
+    # --- lieu d'observation et hauteur de l'objet ----------------------------
+
+    def site(self, meta=None):
+        """(latitude, longitude est) : celles de l'en-tête, sinon celles
+        réglées dans Analyse ▸ Lieu d'observation. None si inconnues."""
+        meta = meta or {}
+        if meta.get("site_lat") is not None and \
+                meta.get("site_lon") is not None:
+            return meta["site_lat"], meta["site_lon"]
+        st = settings()
+        try:
+            lat = st.value("site/lat")
+            lon = st.value("site/lon")
+            if lat in (None, "") or lon in (None, ""):
+                return None
+            return float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None
+
+    def sky_position(self, meta):
+        """(hauteur, azimut, latitude) de l'objet pendant la pose."""
+        meta = meta or {}
+        site = self.site(meta)
+        utc = meta.get("date_utc")
+        if site is None or utc is None or meta.get("ra") is None \
+                or meta.get("dec") is None:
+            return None
+        exp = meta.get("exptime") or 0
+        if (meta.get("camera") or "").upper() in ("TELE", "WIDE"):
+            utc = utc - timedelta(seconds=exp / 2)   # Dwarf : date de fin
+        else:
+            utc = utc + timedelta(seconds=exp / 2)   # milieu de la pose
+        alt, az = alt_az(meta["ra"], meta["dec"], site[0], site[1], utc)
+        return alt, az, site[0]
+
+    def fill_altitude(self, item):
+        pos = self.sky_position(item.data(0, ROLE_META))
+        if pos is None:
+            item.setText(COL_ALT, "")
+            item.setData(COL_ALT, ROLE_SORT, None)
+            return False
+        item.setText(COL_ALT, f"{pos[0]:.0f}°")
+        item.setData(COL_ALT, ROLE_SORT, pos[0])
+        return True
+
+    def refresh_altitudes(self):
+        sorting = self.list.isSortingEnabled()
+        self.list.setSortingEnabled(False)
+        known = [self.fill_altitude(it) for it in self.all_items()
+                 if self.item_type(it) == "light"]
+        self.list.setSortingEnabled(sorting)
+        self.list.setColumnHidden(COL_ALT, not any(known))
+        self.refresh_graph()
+
+    def site_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Lieu d'observation")
+        form = QFormLayout(dlg)
+        st = settings()
+        lat, lon = QDoubleSpinBox(), QDoubleSpinBox()
+        for w, lim in ((lat, 90), (lon, 180)):
+            w.setRange(-lim, lim)
+            w.setDecimals(4)
+            w.setSuffix(" °")
+        try:
+            lat.setValue(float(st.value("site/lat", 46.0)))
+            lon.setValue(float(st.value("site/lon", 2.0)))
+        except (TypeError, ValueError):
+            pass
+        note = QLabel("Sert à calculer la hauteur de l'objet et la rotation "
+                      "de champ attendue quand l'en-tête FITS ne donne pas "
+                      "le lieu (SITELAT, SITELONG). Longitude positive à "
+                      "l'est de Greenwich.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        form.addRow("Latitude (nord +) :", lat)
+        form.addRow("Longitude (est +) :", lon)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                               | QDialogButtonBox.StandardButton.Cancel)
+        box.accepted.connect(dlg.accept)
+        box.rejected.connect(dlg.reject)
+        form.addRow(box)
+        if not dlg.exec():
+            return
+        st.setValue("site/lat", lat.value())
+        st.setValue("site/lon", lon.value())
+        self.refresh_altitudes()
+        self.statusBar().showMessage(
+            f"Lieu d'observation : {fr(lat.value(), 4)}°, "
+            f"{fr(lon.value(), 4)}°", 6000)
 
     def seq_label(self, src):
         """Nom de l'image suivi de son numéro dans la séquence."""
@@ -3358,6 +4100,9 @@ class MainWindow(QMainWindow):
                     added += 1
             if added:
                 self.number_sequence()
+                self.list.setColumnHidden(
+                    COL_ALT, not any(it.data(COL_ALT, ROLE_SORT) is not None
+                                     for it in self.all_items()))
         finally:
             self.list.setSortingEnabled(True)
             self.list.setUpdatesEnabled(True)
@@ -3406,6 +4151,7 @@ class MainWindow(QMainWindow):
         self.transforms, self.rot_rates = {}, {}
         self.zone, self.zone_dirty, self._geom_key = None, True, None
         self._dark_stats = {}
+        self._flat_stats = {}
         self._item_index = {}
         self.refresh_graph()
         self.current_src = None
@@ -3431,6 +4177,7 @@ class MainWindow(QMainWindow):
                                        for t in FRAME_TYPES if t in counts)
         self.count_label.setText(text)
         self.update_type_tabs(counts)
+        self.update_series_box()
         self.refresh_graph()
 
     # --- onglets par type ----------------------------------------------------
@@ -3476,7 +4223,8 @@ class MainWindow(QMainWindow):
         key = self.current_tab_key()
         self.list.setUpdatesEnabled(False)
         for it in self.all_items():
-            it.setHidden(key is not None and self.item_type(it) != key)
+            it.setHidden((key is not None and self.item_type(it) != key)
+                         or not self.in_work(it))
         self.list.setUpdatesEnabled(True)
         cur = self.list.currentItem()
         if cur is None or cur.isHidden():
@@ -3528,12 +4276,17 @@ class MainWindow(QMainWindow):
                 text = ", ".join(short)
             elif "dark non conforme" in short:
                 text = "dark non conforme"
+            elif "flat non conforme" in short:
+                text = "flat non conforme"
             else:
                 text = "à la main"
         elif short and item.data(0, ROLE_MANUAL):
             text = "gardée (" + ", ".join(short) + ")"
         else:
             text = ""
+        m = self.measures.get(item.data(0, ROLE_SRC)) or {}
+        if m.get("trail"):
+            text = (text + ", traînée") if text else "traînée"
         item.setText(COL_REASON, text)
         item.setData(COL_REASON, ROLE_SORT, text or None)
         if reasons:
@@ -3733,7 +4486,7 @@ class MainWindow(QMainWindow):
                 f"{n} images enregistrées dans\n{out}\n({size / 1e6:.0f} Mo)")
 
     def export_folder(self):
-        items = self.all_items()
+        items = self.working_items()
         if not items:
             QMessageBox.information(self, APP_NAME, "La liste est vide.")
             return
@@ -3841,6 +4594,14 @@ class MainWindow(QMainWindow):
             return
         if o["csv"]:
             self.write_csv(os.path.join(root, "mesures.csv"))
+        weight_note = ""
+        if o.get("weight") and created.get("light"):
+            group = next(g for t, g, _ in ordered if t == "light")
+            n_w = sum(write_weight(dst, self.scores[src] / 100.0)
+                      for src, dst in zip(group, created["light"])
+                      if self.scores.get(src) is not None)
+            weight_note = (f"Poids {WEIGHT_KEY} écrit dans {n_w} brute(s) "
+                           f"sur {len(group)}.")
 
         script_note = ""
         if o["script"]:
@@ -3881,6 +4642,13 @@ class MainWindow(QMainWindow):
             lines.append("\n" + report.split("\n", 2)[-1])
         if script_note:
             lines.append("\n" + script_note)
+        if weight_note:
+            lines.append("\n" + weight_note + " Dans ImageIntegration : "
+                         f"Weights = FITS keyword, Weight keyword = "
+                         f"{WEIGHT_KEY}.")
+        if self.active_series is not None:
+            lines.append("\nBrutes de la série : "
+                         + self.series_label(self.active_series))
         if o["target"] == "pixinsight":
             lines.append("\nPixInsight : dans WeightedBatchPreprocessing, "
                          "« Add Directory » sur ce dossier ; WBPP classe "
@@ -4038,6 +4806,7 @@ class MainWindow(QMainWindow):
         geo = self.geometry_text()
         if geo:
             lines += geo + [""]
+        lines += ["Bilan de la séance", "-" * 18, self.session_report(), ""]
         rejected = [it for it in self.all_items() if it.data(0, ROLE_REJ)]
         if self.measures:
             c = self.criteria
@@ -4067,7 +4836,7 @@ class MainWindow(QMainWindow):
         if self.analysis_todo:
             return
         if srcs is None:
-            srcs = [it.data(0, ROLE_SRC) for it in self.all_items()
+            srcs = [it.data(0, ROLE_SRC) for it in self.working_items()
                     if self.item_type(it) == "light"]
             if not srcs and self.list.count():
                 QMessageBox.information(
@@ -4161,6 +4930,13 @@ class MainWindow(QMainWindow):
             lines.append(f"Image de référence : {self.seq_label(ref)}"
                          f"{self.measure_text(ref)}")
         lines.append(crit_msg)
+        cost = self.cost_text()
+        if cost:
+            lines.append(cost)
+        n_tr = sum(1 for r in self.session_rows() if r["trail"])
+        if n_tr:
+            lines.append(f"Traînées (satellites, avions) repérées sur "
+                         f"{n_tr} image(s) : colonne Raison.")
         geo = self.geometry_text(short=True)
         if geo:
             lines.append("\n" + "\n".join(geo)
@@ -4180,7 +4956,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, APP_NAME, "\n".join(lines))
 
     def update_scores(self):
-        present = {it.data(0, ROLE_SRC) for it in self.all_items()}
+        present = {it.data(0, ROLE_SRC) for it in self.working_items()}
         ms = {k: m for k, m in self.measures.items() if k in present}
         self.scores = compute_scores(ms)
         self.planet = series_mode(ms) == "planet"
@@ -4260,6 +5036,9 @@ class MainWindow(QMainWindow):
             tip += ("\n★ Image de référence (choisie à la main)"
                     if src == self.ref_manual else
                     "\n★ Image de référence (meilleur score)")
+        if m and m.get("trail"):
+            tip += (f"\nTraînée probable (satellite, avion) : "
+                    f"{m['trail']['length']:.0f} px")
         meta = item.data(0, ROLE_META) or {}
         if meta.get("temp") is not None:
             tip += f"\nCapteur : {fr(meta['temp'], 1)} °C"
@@ -4295,18 +5074,20 @@ class MainWindow(QMainWindow):
             parts.append(t)
             parts.append(f"excentricité {fr(m['ecc'], 2)}")
         parts.append(f"{m['stars']} étoiles")
+        if m.get("trail"):
+            parts.append("traînée")
         return "   |   " + "   ".join(parts)
 
     def apply_preselection(self):
         """Rejette les mauvaises images selon les critères. Les images
         tranchées à la main ne sont jamais modifiées. Renvoie un résumé."""
-        present = {it.data(0, ROLE_SRC) for it in self.all_items()}
+        present = {it.data(0, ROLE_SRC) for it in self.working_items()}
         ms = {k: m for k, m in self.measures.items() if k in present}
         bad = preselect(ms, self.criteria)
         n_auto, causes = 0, {}
         sorting = self.list.isSortingEnabled()
         self.list.setSortingEnabled(False)
-        for it in self.all_items():
+        for it in self.working_items():
             src = it.data(0, ROLE_SRC)
             reasons = bad.get(src)
             it.setData(0, ROLE_REASONS, reasons)
@@ -4565,7 +5346,7 @@ class MainWindow(QMainWindow):
             if z and z["rect"]:
                 x0, y0, x1, y1 = z["rect"]
                 extra += (f"   |   zone utile {int(x1 - x0)}×{int(y1 - y0)}"
-                          f" px ({(x1 - x0) * (y1 - y0) / (z['w'] * z['h']):.0%})")
+                          f" px ({pct((x1 - x0) * (y1 - y0) / (z['w'] * z['h']))})")
             elif key[0] not in self.transforms:
                 extra += "   |   zone utile : lancez l'analyse (Ctrl+R)"
         if tile:
@@ -4642,7 +5423,7 @@ class MainWindow(QMainWindow):
 
     def refresh_graph(self):
         entries = []
-        for it in self.all_items():
+        for it in self.working_items():
             src = it.data(0, ROLE_SRC)
             m = self.measures.get(src)
             if not m or self.item_type(it) != "light":
@@ -4657,8 +5438,11 @@ class MainWindow(QMainWindow):
         rot = {s: self.display_angle(t["angle"])
                for s, t in self.transforms.items() if t} \
             if self.field_rotates() else {}
+        alt = {e[0]: self.find_item(e[0]).data(COL_ALT, ROLE_SORT)
+               for e in entries}
+        alt = {k: v for k, v in alt.items() if v is not None}
         self.graph.set_data(entries, limits,
-                            limits.get("mode") == "planet", rot)
+                            limits.get("mode") == "planet", rot, alt)
         self.graph.set_current(self.current_src)
 
     # --- rotation de champ et zone utile -------------------------------------
@@ -4686,7 +5470,7 @@ class MainWindow(QMainWindow):
         champ de chaque image et vitesse de rotation."""
         stars = {}
         if not self.planet:
-            for it in self.all_items():
+            for it in self.working_items():
                 src = it.data(0, ROLE_SRC)
                 m = self.measures.get(src)
                 if (m and self.item_type(it) == "light"
@@ -4735,7 +5519,7 @@ class MainWindow(QMainWindow):
             return None
         w, h = m["shape"]
         kept = {}
-        for it in self.all_items():
+        for it in self.working_items():
             src = it.data(0, ROLE_SRC)
             if src in self.transforms and not it.data(0, ROLE_REJ):
                 kept[src] = self.transforms[src]
@@ -4834,7 +5618,7 @@ class MainWindow(QMainWindow):
             if part < 0.995 or lines:
                 lines.append(f"Zone utile après empilement : "
                              f"{int(x1 - x0)}×{int(y1 - y0)} px "
-                             f"({part:.0%} du champ)")
+                             f"({pct(part)} du champ)")
         return lines
 
     def show_geometry_report(self):
@@ -4888,16 +5672,16 @@ class MainWindow(QMainWindow):
             x0, y0, x1, y1 = z["rect"]
             l, r, t, b = z["margins"]
             out.append(f"• Zone couverte par toutes les images : "
-                       f"{z['frac']:.0%} du champ")
+                       f"{pct(z['frac'])} du champ")
             out.append(f"• Plus grand rectangle : {int(x1 - x0)}×"
                        f"{int(y1 - y0)} px sur {w}×{h} "
-                       f"({(x1 - x0) * (y1 - y0) / (w * h):.0%})")
+                       f"({pct((x1 - x0) * (y1 - y0) / (w * h))})")
             out.append(f"• À rogner : {int(l)} px à gauche, {int(r)} à "
                        f"droite, {int(t)} en haut, {int(b)} en bas")
             if z["gains"]:
                 out.append("• Images qui réduisent le plus la zone :")
                 for s, g in z["gains"][:5]:
-                    out.append(f"    {src_name(s)} : +{g:.0%} de surface "
+                    out.append(f"    {src_name(s)} : +{pct(g)} de surface "
                                f"si on la rejette")
             out.append("La touche Z affiche la zone sur l'image.")
         else:
@@ -4977,7 +5761,7 @@ class MainWindow(QMainWindow):
 
     def first_as_reference(self):
         """Référence = la première brute prise, comme le Dwarf 3."""
-        lights = [it.data(0, ROLE_SRC) for it in self.all_items()
+        lights = [it.data(0, ROLE_SRC) for it in self.working_items()
                   if self.item_type(it) == "light"]
         scored = [s for s in self.light_order(lights) if s in self.scores]
         if not scored:
@@ -5049,7 +5833,7 @@ class MainWindow(QMainWindow):
             return 2.0
 
     def show_dark_control(self):
-        items = list(self.all_items())
+        items = list(self.working_items())
         darks = [(it.data(0, ROLE_SRC), it.data(0, ROLE_META) or {})
                  for it in items if self.item_type(it) == "dark"]
         lights = [(it.data(0, ROLE_SRC), it.data(0, ROLE_META) or {})
@@ -5151,7 +5935,7 @@ class MainWindow(QMainWindow):
                 cell(gtab, r, 4, f"{g['darks']}  ({rng(g['dark_temps'])})"
                      if g["darks"] else "0")
                 cell(gtab, r, 5, "?" if g["cover"] is None
-                     else f"{g['cover']:.0%}", right=True)
+                     else f"{pct(g['cover'])}", right=True)
                 cell(gtab, r, 6, g["verdict"][1], g["verdict"][0])
             dtab.setRowCount(len(darks))
             for r, (s, m) in enumerate(darks):
@@ -5202,11 +5986,327 @@ class MainWindow(QMainWindow):
         fill()
         dlg.exec()
 
+    # --- bilan de la séance ------------------------------------------------------
+
+    def session_rows(self):
+        """Une ligne par brute de la série en cours, avec ses mesures."""
+        rows = []
+        for it in self.working_items():
+            if self.item_type(it) != "light":
+                continue
+            src = it.data(0, ROLE_SRC)
+            meta = it.data(0, ROLE_META) or {}
+            m = self.measures.get(src) or {}
+            pos = self.sky_position(meta)
+            rows.append({
+                "src": src, "name": it.text(COL_NAME), "date": meta.get("date"),
+                "exp": meta.get("exptime"), "temp": meta.get("temp"),
+                "alt": pos[0] if pos else None, "az": pos[1] if pos else None,
+                "lat": pos[2] if pos else None, "fwhm": m.get("fwhm"),
+                "bg": m.get("bg"), "trail": m.get("trail"),
+                "measured": bool(m), "kept": not it.data(0, ROLE_REJ),
+                "eqmode": meta.get("eqmode")})
+        return rows
+
+    def cost_text(self, rows=None):
+        rows = [r for r in (rows or self.session_rows()) if r["measured"]]
+        if not rows:
+            return ""
+        c = rejection_cost(rows)
+        if c["kept"] == c["n"]:
+            return ""
+        txt = (f"Tri : {c['n'] - c['kept']} image(s) écartée(s), "
+               f"{pct(c['time_lost'])} du temps de pose")
+        if c["exp_total"]:
+            txt += f" ({hm(c['exp_total'] - c['exp_kept'])})"
+        txt += f", soit environ {pct(c['snr_loss'])} de signal/bruit en moins"
+        if "fwhm_gain" in c and c["fwhm_gain"] > 0.002:
+            txt += (f" ; FWHM médiane {fr(c['fwhm_all'], 2)} → "
+                    f"{fr(c['fwhm_kept'], 2)} px ({pct(c['fwhm_gain'])} plus "
+                    f"fin)")
+        return txt + "."
+
+    def session_report(self):
+        rows = self.session_rows()
+        meas = [r for r in rows if r["measured"]]
+        out = []
+        if self.active_series is not None:
+            out += [f"Série : {self.series_label(self.active_series)}", ""]
+        kept = [r for r in rows if r["kept"]]
+        exp_k = sum(r["exp"] or 0 for r in kept)
+        exp_t = sum(r["exp"] or 0 for r in rows)
+        out.append(f"{len(rows)} brute(s), {len(kept)} gardée(s)"
+                   + (f" : {hm(exp_k)} de pose sur {hm(exp_t)}"
+                      if exp_t else ""))
+        # coût du tri
+        out += ["", "CE QUE COÛTE LE TRI"]
+        if meas:
+            c = rejection_cost(meas)
+            if c["kept"] == c["n"]:
+                out.append("• Aucune image écartée.")
+            else:
+                out.append(f"• Temps de pose perdu : {pct(c['time_lost'])}"
+                           + (f" ({hm(c['exp_total'] - c['exp_kept'])})"
+                              if c["exp_total"] else ""))
+                out.append(f"• Rapport signal/bruit : environ "
+                           f"{pct(c['snr_loss'])} de moins qu'avec toutes "
+                           f"les images (il varie comme la racine du temps "
+                           f"de pose)")
+                if "fwhm_gain" in c:
+                    out.append(f"• FWHM médiane : {fr(c['fwhm_all'], 2)} px "
+                               f"avec toutes les images, "
+                               f"{fr(c['fwhm_kept'], 2)} px avec les "
+                               f"gardées ({pct(c['fwhm_gain'], sign=True)} de finesse)")
+                out.append("  Écarter une image vaut la peine quand elle "
+                           "dégrade la finesse plus qu'elle n'apporte de "
+                           "signal.")
+        else:
+            out.append("• Lancez l'analyse (Ctrl+R).")
+        # nuits
+        nights = nights_summary(rows)
+        if nights and nights[0]["night"] is not None:
+            out += ["", "NUITS" if len(nights) > 1 else "LA NUIT"]
+            for n in nights:
+                line = f"• Nuit du {n['night']:%d/%m/%Y}"
+                if n["span"]:
+                    line += (f", {n['span'][0]:%H:%M} – "
+                             f"{n['span'][1]:%H:%M}")
+                line += (f" : {n['kept']}/{n['n']} gardées, "
+                         f"{hm(n['exp_kept'])} de pose")
+                out.append(line)
+                det = []
+                if n["fwhm"]:
+                    det.append(f"FWHM {fr(n['fwhm'], 2)} px")
+                if n["bg"] is not None:
+                    det.append(f"fond {n['bg']:.0f}")
+                if n["temps"]:
+                    det.append(f"capteur {fr(n['temps'][0], 1)} à "
+                               f"{fr(n['temps'][1], 1)} °C")
+                if n["alts"]:
+                    det.append(f"hauteur {n['alts'][0]:.0f}° à "
+                               f"{n['alts'][1]:.0f}°")
+                if n["trails"]:
+                    det.append(f"{n['trails']} traînée(s)")
+                if det:
+                    out.append("    " + ", ".join(det))
+            if len(nights) > 1:
+                fw = [n["fwhm"] for n in nights if n["fwhm"]]
+                best = min((n for n in nights if n["fwhm"]),
+                           key=lambda n: n["fwhm"], default=None)
+                if best and max(fw) > 1.03 * min(fw):
+                    out.append(f"  Meilleure nuit pour la finesse : "
+                               f"{best['night']:%d/%m}. L'export réunit "
+                               f"toutes les nuits gardées dans un seul "
+                               f"empilement.")
+        # mise au point et température
+        out += ["", "MISE AU POINT ET TEMPÉRATURE"]
+        fd = focus_drift(rows)
+        if fd is None:
+            out.append("• Pas assez de brutes mesurées avec une température "
+                       "(il en faut 10).")
+        elif not fd["enough"]:
+            out.append(f"• Le capteur n'a varié que de {fr(fd['range'], 1)} °C"
+                       " : pas de dérive mesurable.")
+        else:
+            out.append(f"• Capteur de {fr(fd['t_min'], 1)} à "
+                       f"{fr(fd['t_max'], 1)} °C sur {fd['n']} images.")
+            if fd["significant"]:
+                sens = "baisse" if fd["slope"] < 0 else "hausse"
+                out.append(f"• La FWHM augmente d'environ "
+                           f"{fr(abs(fd['slope']) * 100, 1)} % par degré de "
+                           f"{sens} (corrélation {fr(fd['r'], 2)}"
+                           + (", hauteur de l'objet prise en compte"
+                              if fd["with_alt"] else "") + ").")
+                if "refocus_every" in fd:
+                    out.append(f"• Conseil : refaites la mise au point "
+                               f"tous les {fr(fd['refocus_every'], 1)} °C "
+                               f"environ (5 % de FWHM perdus au-delà).")
+                else:
+                    out.append("• La FWHM se dégrade quand le capteur se "
+                               "réchauffe : vérifiez la mise au point en "
+                               "début de séance.")
+            else:
+                out.append(f"• Pas de lien net entre FWHM et température "
+                           f"(corrélation {fr(fd['r'], 2)}) : la mise au "
+                           f"point a tenu.")
+        # hauteur et rotation
+        out += ["", "HAUTEUR DE L'OBJET"]
+        with_alt = [r for r in rows if r["alt"] is not None]
+        if not with_alt:
+            if not any(self.site(it.data(0, ROLE_META))
+                       for it in self.working_items()):
+                out.append("• Lieu d'observation inconnu : indiquez-le dans "
+                           "Analyse ▸ Lieu d'observation pour calculer la "
+                           "hauteur et la rotation attendue.")
+            else:
+                out.append("• Les en-têtes ne donnent pas la position de "
+                           "l'objet (RA, DEC).")
+        else:
+            alts = [r["alt"] for r in with_alt]
+            out.append(f"• De {min(alts):.0f}° à {max(alts):.0f}° au-dessus "
+                       f"de l'horizon.")
+            low = [r for r in with_alt if r["alt"] < 30]
+            if low:
+                out.append(f"• {len(low)} image(s) sous 30° : l'atmosphère "
+                           f"y épaissit les étoiles et monte le fond.")
+            alt_az_mount = any(r["eqmode"] == 0 for r in rows) or \
+                self.field_rotates()
+            if alt_az_mount:
+                lat = with_alt[0]["lat"]
+                theo = {r["src"]: rotation_rate_theory(lat, r["alt"], r["az"])
+                        for r in with_alt}
+                pairs = [(abs(self.rot_rates[s] * 60), abs(v))
+                         for s, v in theo.items()
+                         if v is not None and s in self.rot_rates
+                         and abs(v) > 2]
+                if len(pairs) >= 5:
+                    ratio = float(np.median([a / b for a, b in pairs]))
+                    out.append(f"• Rotation mesurée / rotation attendue : "
+                               f"{fr(ratio, 2)}"
+                               + (" (cohérent)" if 0.8 < ratio < 1.25 else
+                                  " : vérifiez le lieu d'observation"))
+                st = self.rotation_stats() or {}
+                win = slow_exposure_windows(
+                    with_alt, lat, st.get("fwhm"), st.get("halfdiag"),
+                    st.get("exptime"))
+                for a, b, rate in win:
+                    out.append(f"• De {a:%H:%M} à {b:%H:%M}, la rotation "
+                               f"(jusqu'à {fr(rate, 0)}°/h) allonge les "
+                               f"étoiles des coins pendant les poses de "
+                               f"{_fs(st.get('exptime'))} s.")
+                if st and not win and st.get("exptime"):
+                    out.append(f"• La rotation reste assez lente pour des "
+                               f"poses de {_fs(st['exptime'])} s.")
+        # traînées
+        out += ["", "TRAÎNÉES (satellites, avions)"]
+        tr = [r for r in meas if r["trail"]]
+        if not meas:
+            out.append("• Lancez l'analyse (Ctrl+R).")
+        elif not tr:
+            out.append("• Aucune traînée repérée.")
+        else:
+            out.append(f"• {len(tr)} image(s) sur {len(meas)} : "
+                       + ", ".join(r["name"] for r in tr[:8])
+                       + (" …" if len(tr) > 8 else ""))
+            out.append("  La réjection des pixels à l'empilement (sigma "
+                       "clipping) efface en général les traînées : inutile "
+                       "de rejeter ces images si elles sont nombreuses.")
+        return "\n".join(out)
+
+    def show_session_report(self):
+        if not self.list.count():
+            QMessageBox.information(self, APP_NAME, "La liste est vide.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bilan de la séance")
+        lay = QVBoxLayout(dlg)
+        txt = QPlainTextEdit(self.session_report())
+        txt.setReadOnly(True)
+        txt.setMinimumSize(680, 460)
+        lay.addWidget(txt)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(dlg.reject)
+        lay.addWidget(box)
+        dlg.exec()
+
+    # --- contrôle des flats ----------------------------------------------------
+
+    def show_flat_control(self):
+        items = list(self.working_items())
+        flats = [(it.data(0, ROLE_SRC), it.data(0, ROLE_META) or {})
+                 for it in items if self.item_type(it) == "flat"]
+        lights = [(it.data(0, ROLE_SRC), it.data(0, ROLE_META) or {})
+                  for it in items if self.item_type(it) == "light"
+                  and not it.data(0, ROLE_REJ)]
+        if not flats:
+            QMessageBox.information(
+                self, "Contrôle des flats",
+                "Aucun flat dans la liste.\nAjoutez le dossier des flats : "
+                "leur type est reconnu d'après l'en-tête (IMAGETYP) ou le nom "
+                "du dossier (Flats).")
+            return
+        stats = self._flat_stats
+        todo = [s for s, _ in flats if s not in stats]
+        if todo:
+            prog = QProgressDialog("Mesure des flats…", "Arrêter", 0,
+                                   len(todo), self)
+            prog.setWindowModality(Qt.WindowModality.WindowModal)
+            prog.setMinimumDuration(300)
+            for k, s in enumerate(todo):
+                prog.setValue(k)
+                QApplication.processEvents()
+                if prog.wasCanceled():
+                    break
+                try:
+                    data, _h, bitpix = read_source(s)
+                    stats[s] = flat_stats(data, bitpix)
+                except Exception:   # noqa: BLE001
+                    pass
+            prog.close()
+        verdicts, advice = flat_control(flats, stats, lights)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Contrôle des flats")
+        dlg.resize(820, 520)
+        lay = QVBoxLayout(dlg)
+        tab = QTableWidget()
+        tab.setColumnCount(6)
+        tab.setHorizontalHeaderLabels(["Fichier", "Filtre", "Niveau",
+                                       "Dynamique", "Vignetage", "Verdict"])
+        colors = {"ok": QColor("#3c9d5d"), "warn": QColor("#d08a20"),
+                  "bad": QColor("#e05555")}
+        tab.setRowCount(len(flats))
+        for r, (s, m) in enumerate(flats):
+            st = stats.get(s) or {}
+            lvl, txt = verdicts[s]
+            vals = [src_name(s), m.get("filter") or "",
+                    f"{st['median']:.0f}" if st else "",
+                    f"{pct(st['level'])}" if st else "",
+                    f"{pct(st['vignetting'])}" if st else "", txt]
+            for c, v in enumerate(vals):
+                itm = QTableWidgetItem(v)
+                itm.setFlags(itm.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if c in (2, 3, 4):
+                    set_align(itm, None, ALIGN_RIGHT)
+                if c == 5 and lvl in colors:
+                    itm.setForeground(colors[lvl])
+                tab.setItem(r, c, itm)
+        tab.resizeColumnsToContents()
+        tab.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(tab, 1)
+        bad = [s for s, v in verdicts.items() if v[0] == "bad"]
+        ok = sum(1 for v in verdicts.values() if v[0] == "ok")
+        lab = QLabel(f"{ok} flat(s) conforme(s), {len(bad)} non conforme(s). "
+                     + " ".join(advice))
+        lab.setWordWrap(True)
+        lay.addWidget(lab)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn = box.addButton("Rejeter les flats non conformes",
+                            QDialogButtonBox.ButtonRole.ActionRole)
+        btn.setEnabled(bool(bad))
+        box.rejected.connect(dlg.reject)
+
+        def reject_bad():
+            n = 0
+            for s in bad:
+                it = self.find_item(s)
+                if it is not None and not it.data(0, ROLE_REJ):
+                    it.setData(0, ROLE_REASONS,
+                               [f"flat : {verdicts[s][1]}"])
+                    self.set_rejected(it, True, manual=True)
+                    n += 1
+            self.update_count()
+            self.statusBar().showMessage(f"{n} flat(s) rejeté(s)", 6000)
+            btn.setEnabled(False)
+        btn.clicked.connect(reject_bad)
+        lay.addWidget(box)
+        dlg.exec()
+
     # --- calibrations --------------------------------------------------------
 
     def kept_metas(self):
         return [it.data(0, ROLE_META) or {"type": "light"}
-                for it in self.all_items() if not it.data(0, ROLE_REJ)]
+                for it in self.working_items() if not it.data(0, ROLE_REJ)]
 
     def calibration_report(self, metas):
         summary, issues = check_calibration(metas, self.dark_tolerance())

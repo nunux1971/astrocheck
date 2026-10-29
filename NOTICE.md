@@ -193,13 +193,14 @@ Les mesures s'affichent dans des colonnes de la liste. Survolez un titre de colo
 | --- | --- | --- |
 | N° | Numéro de l'image dans la séquence de prise de vue (1 = la première), compté séparément pour chaque dossier et chaque type ; il ne change ni avec l'analyse, ni avec le tri, ni avec les rejets | — |
 | Temp. | Température du capteur en °C, lue dans l'en-tête (CCD-TEMP, DET-TEMP…) ou dans le nom du fichier ; affichée aussi pour les darks et les flats | — |
+| Haut. | Hauteur de l'objet au-dessus de l'horizon au moment de la pose, d'après RA, DEC, la date et le lieu d'observation ; affichée quand on la connaît | — |
 | Score | Qualité globale, de 0 à 100 ; 100 = meilleure image de la série | Tout ce qui suit |
 | FWHM | Largeur des étoiles à mi-hauteur, en pixels du capteur (plus petit = plus net) | Turbulence, mise au point, flou de bougé |
 | Excent. | Forme des étoiles : 0 = rondes, proche de 1 = allongées | Suivi, vent, mise en station |
 | Rot. | Rotation du champ par rapport à l'image de référence, en degrés (positif = sens inverse des aiguilles d'une montre à l'écran) ; affichée seulement si le champ tourne | Monture alt-azimutale, défaut de mise en station |
 | Étoiles | Nombre d'étoiles détectées | Nuages, buée, voile |
 | Fond | Niveau du fond de ciel | Lune, aube, voile, pollution lumineuse |
-| Raison | Pourquoi l'image est rejetée | — |
+| Raison | Pourquoi l'image est rejetée ; « traînée » signale un satellite ou un avion | — |
 
 Le score combine surtout la FWHM, puis le nombre d'étoiles, leur rondeur et le bruit. Chaque mesure est comparée à la médiane de la série : le score dit comment une image se situe par rapport à ses voisines de la même nuit, pas dans l'absolu.
 
@@ -265,6 +266,8 @@ Après l'analyse, un graphique s'ouvre sous l'image. Il trace, pour chaque brute
 - Survolez un point pour lire sa valeur, cliquez dessus pour afficher l'image.
 - Si le champ tourne (monture alt-azimutale), un panneau Rotation montre l'angle de chaque image par rapport à la référence.
 
+Si le lieu d'observation est connu, un panneau **Hauteur** montre la hauteur de l'objet. Pour une série prise sur plusieurs nuits, chaque nuit a sa portion de graphique, séparée par un trait en tirets et marquée « nuit du … ».
+
 Le graphique rend visible en un coup d'œil ce que les colonnes cachent : un passage nuageux (le fond monte, les étoiles baissent pendant quelques minutes), la turbulence qui varie, ou un défaut de suivi régulier (l'excentricité qui oscille avec la période de la vis sans fin). Pour un SER planétaire, il affiche la netteté et le fond.
 
 Le graphique est en heure locale : les dates des fichiers FITS et SER, enregistrées en temps universel, sont converties selon le fuseau de votre ordinateur. Sans date dans les fichiers, les images sont simplement numérotées dans l'ordre.
@@ -317,6 +320,40 @@ La zone ne compte que les images gardées : rejetez une image très décalée et
 
 Le décalage entre images compte aussi : le dithering ou une dérive du suivi réduisent la zone utile, même sans rotation.
 
+## Bilan de la séance
+
+**Analyse ▸ Bilan de la séance** (Ctrl+B) rassemble ce qu'il faut savoir sur la série en cours. Le même bilan est écrit dans le résumé de la nuit à chaque export.
+
+### Ce que coûte le tri
+
+Le bilan compare les images gardées à l'ensemble de la série :
+
+- le temps de pose perdu, en pourcentage et en minutes ;
+- la perte de rapport signal/bruit, qui varie comme la racine du temps de pose : écarter 25 % des images coûte environ 13 % de signal/bruit ;
+- la FWHM médiane avec toutes les images et avec les seules images gardées.
+
+Écarter une image vaut la peine quand elle dégrade la finesse plus qu'elle n'apporte de signal. Le message de fin d'analyse donne aussi ce coût en une ligne.
+
+### Plusieurs nuits
+
+Ajoutez les dossiers de plusieurs nuits sur le même objet : AstroCheck les reconnaît d'après les dates (une image prise à 2 h du matin appartient à la nuit commencée la veille). Le bilan donne, pour chaque nuit, les heures de début et de fin, le nombre d'images gardées, le temps de pose, la FWHM, le fond, la température du capteur et la hauteur de l'objet, puis la meilleure nuit pour la finesse. Le graphique montre les nuits côte à côte, et l'export réunit toutes les images gardées dans un seul empilement.
+
+### Mise au point et température
+
+Quand le capteur se refroidit pendant la nuit, le tube se contracte et la mise au point dérive. AstroCheck compare la FWHM à la température du capteur (au moins 10 images et 1,5 °C d'écart) et, si l'objet a changé de hauteur, retire l'effet de l'atmosphère. S'il trouve un lien net, il indique de combien la FWHM augmente par degré et conseille un intervalle pour refaire la mise au point, par exemple « tous les 2 °C ».
+
+### Hauteur de l'objet et lieu d'observation
+
+La hauteur de l'objet se calcule à partir de RA et DEC dans l'en-tête, de la date et du lieu. Le lieu vient de l'en-tête (SITELAT, SITELONG) ou, à défaut, de **Analyse ▸ Lieu d'observation** : indiquez-y une fois la latitude et la longitude de votre site (longitude positive à l'est de Greenwich).
+
+- La colonne **Haut.** et le panneau Hauteur du graphique montrent la hauteur image par image.
+- Le bilan signale les images prises sous 30°, où l'atmosphère épaissit les étoiles.
+- Avec une monture alt-azimutale, il compare la rotation mesurée à la rotation attendue, et indique les heures où la rotation allonge les étoiles des coins pendant les poses, par exemple quand l'objet passe près du zénith.
+
+### Traînées de satellites et d'avions
+
+Pendant l'analyse, AstroCheck cherche les traînées rectilignes qui traversent l'image. Une image concernée affiche « traînée » dans la colonne Raison, mais n'est pas rejetée : la réjection des pixels à l'empilement (sigma clipping) efface en général ces traînées, d'autant mieux que les images sont nombreuses. Les aigrettes de diffraction des étoiles brillantes et les nébuleuses ne sont pas prises pour des traînées. Une traînée très faible ou très courte peut passer inaperçue.
+
 ## Darks, flats et offsets
 
 AstroCheck reconnaît le type de chaque image et l'affiche dans la colonne **Type** : brute, dark, flat, offset ou dark de flat. Il lit d'abord le mot-clé IMAGETYP de l'en-tête FITS, écrit par la plupart des logiciels d'acquisition. Sans ce mot-clé, notamment pour les CR2, il se fie au nom du fichier, puis à celui du dossier (Darks, Flats, Offsets, Bias…).
@@ -354,6 +391,21 @@ Réglez **l'écart de température toléré** en haut de la fenêtre : 2 °C par
 
 Sous les tableaux, des conseils indiquent les darks à refaire : pose, gain et plage de température à viser. Comptez 15 à 20 darks au moins pour un master dark propre. Le bouton **Rejeter les darks non conformes** les marque comme rejetés, avec la raison « dark non conforme » dans la liste. Ils ne seront ni exportés ni utilisés par le script Siril.
 
+### Contrôle des flats
+
+**Analyse ▸ Contrôle des flats** (Ctrl+Maj+F) mesure chaque flat et donne un verdict.
+
+| Verdict | Ce qu'il signifie |
+| --- | --- |
+| conforme | Niveau correct, motif semblable aux autres flats |
+| trop sombre, trop clair | Le niveau sort de 8 à 85 % de la dynamique ; visez 30 à 60 % |
+| saturé | Plus de 0,5 % des pixels sont saturés |
+| motif différent | Le vignetage ou les poussières ne ressemblent pas aux autres flats : autre filtre, poussière déplacée, caméra tournée entre les flats |
+| niveau très différent | Le niveau s'écarte de plus de 30 % de celui des autres flats |
+| filtre … | Le filtre ne correspond pas à celui des brutes |
+
+La fenêtre indique aussi le vignetage mesuré (lumière perdue dans les coins) et rappelle d'en faire 20 à 30. Le bouton **Rejeter les flats non conformes** les marque comme rejetés, avec la raison « flat non conforme ».
+
 ## Dwarf 3
 
 AstroCheck lit directement les dossiers du Dwarf 3 copiés sur l'ordinateur.
@@ -365,6 +417,8 @@ AstroCheck lit directement les dossiers du Dwarf 3 copiés sur l'ordinateur.
 Le capteur du Dwarf 3 n'est pas refroidi : sa température suit celle de la nuit et varie pendant la séance. La colonne Temp. et le contrôle des darks (Ctrl+Maj+K) montrent si vos darks couvrent bien la plage de température des brutes. Faites-les de préférence juste après la séance, objectif fermé, avec la même pose et le même gain.
 
 La monture alt-azimutale fait tourner le champ : voyez la section « Rotation de champ et zone utile » pour mesurer cette rotation, choisir une référence au milieu de la séance et prévoir le recadrage.
+
+Le Dwarf 3 a deux caméras, TELE et WIDE. Quand la liste contient plusieurs **séries** de brutes, c'est-à-dire des caméras, filtres, poses ou gains différents, un choix **Série** apparaît au-dessus de la liste. L'analyse, la présélection, la référence, la rotation, le bilan et l'export portent sur la série choisie ; les brutes des autres séries sont masquées et restent intactes. Les calibrations (darks, flats, offsets) restent visibles quelle que soit la série.
 
 ## Créer une vidéo SER
 
@@ -412,6 +466,8 @@ Les images sont exportées dans l'ordre de prise de vue, quel que soit le classe
 La numérotation sert surtout avec Siril, qui aligne par défaut sur la première image de la séquence : votre meilleure image devient ainsi la référence sans réglage. PixInsight choisit sa référence lui-même, la numérotation y est donc inutile.
 
 Avec la structure Siril, AstroCheck peut aussi écrire un **script de prétraitement** `traitement.ssf` à la racine du dossier. Il est adapté à ce que vous exportez : masters d'offset, de dark de flat, de flat et de dark s'ils sont présents, calibration des brutes (avec dématriçage pour un capteur couleur), alignement sur la première image, puis empilement. Le résultat est enregistré dans le dossier sous un nom comme `resultat_145x60s.fit`. Le script n'est pas écrit si les brutes mélangent plusieurs filtres. Le rapport de vérification des calibrations s'affiche aussi à la fin de l'export.
+
+Pour pondérer l'empilement par la qualité mesurée par AstroCheck, cochez **Écrire le score de chaque brute dans les copies**. Le score, de 0 à 1, est écrit dans le mot-clé FITS `ACWEIGHT` des brutes copiées. Dans PixInsight, ImageIntegration peut s'en servir : *Image Weighting* ▸ *Weights* = *FITS keyword*, *Weight keyword* = `ACWEIGHT`. L'option n'existe qu'avec « Copier les fichiers » : un lien modifierait l'original, et AstroCheck ne touche jamais à vos fichiers. Les fichiers compressés `.gz` et les CR2 ne reçoivent pas de poids.
 
 ### Lancer Siril depuis AstroCheck
 
@@ -475,6 +531,8 @@ Cette commande sert aussi à extraire quelques images d'un SER, ou à le convert
 | Ctrl+Maj+R | Définir l'image affichée comme référence |
 | Ctrl+Maj+Début | Prendre la première image comme référence (comme le Dwarf 3) |
 | Ctrl+Maj+K | Contrôle des darks |
+| Ctrl+B | Bilan de la séance |
+| Ctrl+Maj+F | Contrôle des flats |
 | Molette | Zoomer / dézoomer |
 | Ctrl+R | Analyser et classer les images |
 | Ctrl+P | Critères de présélection |
