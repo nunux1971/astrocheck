@@ -354,6 +354,20 @@ La hauteur de l'objet se calcule à partir de RA et DEC dans l'en-tête, de la d
 
 Pendant l'analyse, AstroCheck cherche les traînées rectilignes qui traversent l'image. Une image concernée affiche « traînée » dans la colonne Raison, mais n'est pas rejetée : la réjection des pixels à l'empilement (sigma clipping) efface en général ces traînées, d'autant mieux que les images sont nombreuses. Les aigrettes de diffraction des étoiles brillantes et les nébuleuses ne sont pas prises pour des traînées. Une traînée très faible ou très courte peut passer inaperçue.
 
+### Journal des cibles pour AstroPlan
+
+AstroCheck tient un **journal** de vos séances : pour chaque cible, chaque nuit et chaque série (caméra, filtre, pose, gain), le nombre de brutes, combien vous en avez gardé, le temps de pose gardé et la FWHM médiane. AstroPlan lit ce journal et affiche, cible par cible, le temps déjà accumulé face au temps conseillé, et le nombre de nuits qu'il reste à faire.
+
+- Le journal est mis à jour à chaque **export**, et à la demande par **Analyse ▸ Mettre à jour le journal AstroPlan** (Ctrl+J).
+- Il est enregistré dans `~/.config/astrocheck/journal.json`. Une nouvelle mise à jour remplace les entrées de la même nuit et de la même série : vous pouvez trier à nouveau sans créer de doublon.
+- Le nom de la cible vient du mot-clé OBJECT de l'en-tête, sinon du nom du dossier du Dwarf (`DWARF_RAW_<cible>_EXP_…`) ou du fichier ASIAIR (`Light_<cible>_300.0s_…`).
+
+Pour le voir dans AstroPlan, importez le fichier dans l'onglet **Journal**, ou copiez-le à côté de la page sur votre serveur :
+
+```bash
+scp ~/.config/astrocheck/journal.json serveur:/var/www/astroplan/site/journal.json
+```
+
 ## Darks, flats et offsets
 
 AstroCheck reconnaît le type de chaque image et l'affiche dans la colonne **Type** : brute, dark, flat, offset ou dark de flat. Il lit d'abord le mot-clé IMAGETYP de l'en-tête FITS, écrit par la plupart des logiciels d'acquisition. Sans ce mot-clé, notamment pour les CR2, il se fie au nom du fichier, puis à celui du dossier (Darks, Flats, Offsets, Bias…).
@@ -533,6 +547,7 @@ Cette commande sert aussi à extraire quelques images d'un SER, ou à le convert
 | Ctrl+Maj+K | Contrôle des darks |
 | Ctrl+B | Bilan de la séance |
 | Ctrl+Maj+F | Contrôle des flats |
+| Ctrl+J | Mettre à jour le journal AstroPlan |
 | Molette | Zoomer / dézoomer |
 | Ctrl+R | Analyser et classer les images |
 | Ctrl+P | Critères de présélection |

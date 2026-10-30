@@ -31,6 +31,7 @@ Raccourcis principaux
   Ctrl+K      vérifier darks, flats et offsets
   Ctrl+Maj+K  contrôle détaillé des darks (pose, gain, température)
   Ctrl+Maj+F  contrôle des flats (niveau, saturation, motif)
+  Ctrl+J      mettre à jour le journal lu par AstroPlan
   Ctrl+B      bilan de la séance (coût du tri, nuits, mise au point,
               hauteur, traînées)
   Ctrl+U      rotation de champ et zone utile après empilement
