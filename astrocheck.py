@@ -1049,8 +1049,11 @@ def series_mode(measures):
     return "stars" if stellar >= len(ms) / 2.0 else "planet"
 
 
-def compute_scores(measures):
-    """Score de 0 à 100 pour chaque image (100 = image de référence)."""
+def compute_scores(measures, kept=None):
+    """Score de 0 à 100 pour chaque image (100 = meilleure image gardée, qui
+    sert de référence). kept : sources gardées ; une image rejetée peut
+    dépasser 100 si elle n'a été écartée que pour un défaut que le score
+    ignore."""
     ms = {k: m for k, m in measures.items() if m}
     if not ms:
         return {}
@@ -1060,19 +1063,30 @@ def compute_scores(measures):
         med_s = max(1.0, _median(m["stars"] for m in ms.values()))
         med_e = min(0.95, _median(m["ecc"] for m in ms.values()))
         med_n = _median(m["noise"] for m in ms.values())
+        # fond : excès au-dessus du fond le plus bas de la série (le niveau
+        # absolu contient l'offset de la caméra), à quelques fois le bruit près
+        bgs = sorted(m["bg"] for m in ms.values() if m.get("bg") is not None)
+        floor = bgs[len(bgs) // 20] if bgs else 0.0
+        med_x = _median(max(0.0, m["bg"] - floor) for m in ms.values()
+                        if m.get("bg") is not None) or 0.0
         for k, m in ms.items():
             if not m["fwhm"]:
                 raw[k] = 0.0
                 continue
-            raw[k] = (0.45 * min(2.0, (med_f / m["fwhm"]) ** 2)
-                      + 0.25 * min(2.0, m["stars"] / med_s)
+            eps = 3.0 * (m.get("noise") or 1.0)
+            bgf = ((med_x + eps) / (max(0.0, m["bg"] - floor) + eps)
+                   if m.get("bg") is not None else 1.0)
+            raw[k] = (0.40 * min(2.0, (med_f / m["fwhm"]) ** 2)
+                      + 0.20 * min(1.5, m["stars"] / med_s)
                       + 0.15 * min(2.0, (1.0 - m["ecc"]) / (1.0 - med_e))
-                      + 0.15 * min(2.0, med_n / m["noise"]))
+                      + 0.10 * min(2.0, med_n / m["noise"])
+                      + 0.15 * min(1.5, bgf))
     else:
         med_sh = _median(m["sharp"] for m in ms.values()) or 1.0
         for k, m in ms.items():
             raw[k] = m["sharp"] / med_sh
-    best = max(raw.values())
+    pool = [raw[k] for k in raw if kept is None or k in kept] or list(raw.values())
+    best = max(pool)
     return {k: (100.0 * v / best if best > 0 else 0.0) for k, v in raw.items()}
 
 
@@ -4490,6 +4504,17 @@ class MainWindow(QMainWindow):
         self.update_reason(item)
         if item.data(0, ROLE_SRC) in self.transforms:
             self.zone_dirty = True
+        # garder ou rejeter peut changer la meilleure image gardée (référence)
+        if self.scores and not getattr(self, "_rescore_pending", False):
+            self._rescore_pending = True
+            QTimer.singleShot(0, self._rescore_after_reject)
+
+    def _rescore_after_reject(self):
+        self._rescore_pending = False
+        old = self.ref
+        self.update_scores()
+        if self.ref != old:
+            self.reference_changed()
 
     def update_reason(self, item):
         """Remplit la colonne Raison d'une ligne."""
@@ -5187,9 +5212,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, APP_NAME, "\n".join(lines))
 
     def update_scores(self):
-        present = {it.data(0, ROLE_SRC) for it in self.working_items()}
+        work = self.working_items()
+        present = {it.data(0, ROLE_SRC) for it in work}
+        kept = {it.data(0, ROLE_SRC) for it in work if not it.data(0, ROLE_REJ)}
         ms = {k: m for k, m in self.measures.items() if k in present}
-        self.scores = compute_scores(ms)
+        self.scores = compute_scores(ms, kept)
         self.planet = series_mode(ms) == "planet"
         self.ref = self.reference_src()
         sharp = [m["sharp"] for m in ms.values() if m]
@@ -5211,8 +5238,12 @@ class MainWindow(QMainWindow):
         if (self.ref_manual is not None and self.ref_manual in self.scores
                 and self.find_item(self.ref_manual) is not None):
             return self.ref_manual
-        # à égalité, la première dans l'ordre de prise de vue
-        return max(sorted(self.scores, key=lambda k: (k[0], k[1])),
+        # la meilleure image GARDÉE ; à égalité, la première prise
+        def kept(k):
+            it = self.find_item(k)
+            return it is not None and not it.data(0, ROLE_REJ)
+        pool = [k for k in self.scores if kept(k)] or list(self.scores)
+        return max(sorted(pool, key=lambda k: (k[0], k[1])),
                    key=self.scores.get)
 
     def goto_reference(self):

@@ -202,7 +202,7 @@ Les mesures s'affichent dans des colonnes de la liste. Survolez un titre de colo
 | Fond | Niveau du fond de ciel | Lune, aube, voile, pollution lumineuse |
 | Raison | Pourquoi l'image est rejetée ; « traînée » signale un satellite ou un avion | — |
 
-Le score combine surtout la FWHM, puis le nombre d'étoiles, leur rondeur et le bruit. Chaque mesure est comparée à la médiane de la série : le score dit comment une image se situe par rapport à ses voisines de la même nuit, pas dans l'absolu.
+Le score combine surtout la FWHM, puis le nombre d'étoiles, leur rondeur, le niveau du fond de ciel (voile, lumière parasite, nuages éclairés) et le bruit. Chaque mesure est comparée à la médiane de la série : le score dit comment une image se situe par rapport à ses voisines de la même nuit, pas dans l'absolu. Le score 100 revient à la meilleure image **gardée**, qui devient la référence automatique : une image rejetée n'est jamais choisie comme référence, et si vous rejetez la référence, la suivante prend sa place.
 
 L'image de référence est marquée d'une étoile ★ et écrite en gras. C'est une bonne candidate comme référence d'alignement dans Siril ou PixInsight. **Analyse ▸ Aller à l'image de référence** (Ctrl+Début) l'affiche à tout moment.
 
