@@ -368,6 +368,14 @@ Pour le voir dans AstroPlan, importez le fichier dans l'onglet **Journal**, ou c
 scp ~/.config/astrocheck/journal.json serveur:/var/www/astroplan/site/journal.json
 ```
 
+**Envoi automatique.** Par **Analyse ▸ Envoi automatique du journal au serveur…**, donnez une commande de copie : AstroCheck la lance en arrière-plan après chaque mise à jour du journal, et la barre d'état affiche si l'envoi a réussi. `{fichier}` est remplacé par le chemin du journal. Le bouton **Exemple** propose :
+
+```bash
+scp -o BatchMode=yes -o ConnectTimeout=15 {fichier} cioeri@astroplan.ericcioli.fr:/var/www/astroplan/site/journal.json
+```
+
+La commande ne doit pas demander de mot de passe. Une fois pour toutes, sur l'ordinateur : `ssh-keygen` (touche Entrée à chaque question), puis `ssh-copy-id cioeri@astroplan.ericcioli.fr`. Sur le serveur, rendez le fichier modifiable par votre compte : `sudo touch /var/www/astroplan/site/journal.json && sudo chown cioeri /var/www/astroplan/site/journal.json`. Le bouton **Tester l'envoi** vérifie le tout.
+
 ## Darks, flats et offsets
 
 AstroCheck reconnaît le type de chaque image et l'affiche dans la colonne **Type** : brute, dark, flat, offset ou dark de flat. Il lit d'abord le mot-clé IMAGETYP de l'en-tête FITS, écrit par la plupart des logiciels d'acquisition. Sans ce mot-clé, notamment pour les CR2, il se fie au nom du fichier, puis à celui du dossier (Darks, Flats, Offsets, Bias…).

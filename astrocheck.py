@@ -35,6 +35,7 @@ import re
 import struct
 import unicodedata
 import subprocess
+import shlex
 import functools
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -1432,6 +1433,21 @@ def journal_entries(rows):
             "fwhm": _median([r.get("fwhm") for r in kept]),
             "updated": datetime.now().isoformat(timespec="seconds")})
     return out
+
+
+UPLOAD_EXAMPLE = ("scp -o BatchMode=yes -o ConnectTimeout=15 {fichier} "
+                  "cioeri@astroplan.ericcioli.fr:/var/www/astroplan/site/journal.json")
+
+
+def upload_command(template, path):
+    """Commande d'envoi du journal : {fichier} (ou {file}) est remplacé par
+    le chemin du journal ; sans marque, le chemin est ajouté à la fin."""
+    args = shlex.split(template or "")
+    if not args:
+        return None
+    if any("{fichier}" in a or "{file}" in a for a in args):
+        return [a.replace("{fichier}", path).replace("{file}", path) for a in args]
+    return args + [path]
 
 
 def merge_journal(path, entries):
@@ -3821,6 +3837,8 @@ class MainWindow(QMainWindow):
                      "Ctrl+B")
         self._action(m, "Mettre à jour le journal AstroPlan",
                      self.update_journal, "Ctrl+J")
+        self._action(m, "Envoi automatique du journal au serveur…",
+                     self.upload_dialog)
         self._action(m, "Rotation de champ et zone utile…",
                      self.show_geometry_report, "Ctrl+U")
         self._action(m, "Lieu d'observation…", self.site_dialog)
@@ -6310,6 +6328,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME,
                                     f"Journal non enregistré :\n{e}")
             return None
+        sending = self.start_journal_upload(path)
         if not quiet:
             lines = [f"Journal AstroPlan mis à jour : {len(entries)} "
                      f"séance(s).", ""]
@@ -6317,12 +6336,128 @@ class MainWindow(QMainWindow):
                 lines.append(f"  {e['object']} · nuit du {e['night']} · "
                              f"{e['kept']}/{e['n']} gardées · "
                              f"{hm(e['exp_kept'])}")
-            lines += ["", f"Fichier : {path}",
-                      "Importez-le dans AstroPlan (onglet Journal), ou copiez-le "
-                      "à côté de la page sur votre serveur :",
-                      f"scp {path} serveur:/var/www/astroplan/site/journal.json"]
+            if sending:
+                lines += ["", f"Fichier : {path}",
+                          "Envoi au serveur en cours : le résultat s'affichera "
+                          "dans la barre d'état."]
+            else:
+                lines += ["", f"Fichier : {path}",
+                          "Importez-le dans AstroPlan (onglet Journal), ou "
+                          "réglez l'envoi automatique (Analyse ▸ Envoi "
+                          "automatique du journal au serveur)."]
             QMessageBox.information(self, APP_NAME, "\n".join(lines))
         return path
+
+    # -- envoi du journal au serveur d'AstroPlan
+    def start_journal_upload(self, path, template=None):
+        """Lance la commande d'envoi en arrière-plan ; renvoie True si lancée."""
+        if template is None:
+            template = settings().value("journal/upload", "") or ""
+        cmd = upload_command(template, path)
+        if not cmd:
+            return False
+        if getattr(self, "_upload", None) and self._upload.poll() is None:
+            self._upload_again = path          # un envoi est en cours : on refera après
+            return True
+        try:
+            self._upload = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            self.statusBar().showMessage(f"Envoi du journal impossible : {e}", 10000)
+            return False
+        self._upload_again = None
+        self._upload_t0 = datetime.now()
+        self.statusBar().showMessage("Envoi du journal au serveur…")
+        if not getattr(self, "_upload_timer", None):
+            self._upload_timer = QTimer(self)
+            self._upload_timer.timeout.connect(self._poll_upload)
+        self._upload_timer.start(500)
+        return True
+
+    def _poll_upload(self):
+        p = self._upload
+        if p.poll() is None:
+            if (datetime.now() - self._upload_t0).total_seconds() > 90:
+                p.kill()
+                self.statusBar().showMessage(
+                    "Envoi du journal abandonné : pas de réponse du serveur en "
+                    "90 s.", 15000)
+                self._upload_timer.stop()
+            return
+        self._upload_timer.stop()
+        out = (p.stdout.read() if p.stdout else "").strip()
+        if p.returncode == 0:
+            self.statusBar().showMessage(
+                "Journal envoyé au serveur : AstroPlan est à jour.", 10000)
+        else:
+            last = out.splitlines()[-1] if out else f"code {p.returncode}"
+            self.statusBar().showMessage(f"Échec de l'envoi du journal : {last}",
+                                         20000)
+        self._upload_last = (p.returncode, out)
+        if self._upload_again:
+            again, self._upload_again = self._upload_again, None
+            self.start_journal_upload(again)
+
+    def upload_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Envoi automatique du journal")
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            "Après chaque mise à jour du journal (export, ou Ctrl+J), AstroCheck "
+            "lance cette commande pour copier le journal à côté de la page "
+            "AstroPlan sur votre serveur. {fichier} est remplacé par le chemin "
+            "du journal. Laissez vide pour ne rien envoyer.\n\n"
+            "La commande ne doit pas demander de mot de passe : utilisez une clé "
+            "SSH (ssh-keygen puis ssh-copy-id), voir le README d'AstroPlan.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        edit = QLineEdit(settings().value("journal/upload", "") or "")
+        edit.setPlaceholderText(UPLOAD_EXAMPLE)
+        edit.setMinimumWidth(620)
+        lay.addWidget(edit)
+        row = QHBoxLayout()
+        ex = QPushButton("Exemple")
+        ex.clicked.connect(lambda: edit.setText(UPLOAD_EXAMPLE))
+        test = QPushButton("Tester l'envoi")
+        state = QLabel("")
+        state.setWordWrap(True)
+
+        def run_test():
+            path = journal_path()
+            if not os.path.exists(path):
+                state.setText("Pas encore de journal : faites d'abord Ctrl+J.")
+                return
+            cmd = upload_command(edit.text(), path)
+            if not cmd:
+                state.setText("Commande vide.")
+                return
+            state.setText("Envoi…")
+            QApplication.processEvents()
+            try:
+                r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=60)
+                msg = (r.stdout + r.stderr).strip()
+                state.setText("Envoi réussi." if r.returncode == 0 else
+                              f"Échec (code {r.returncode}) : {msg[-400:]}")
+            except (OSError, subprocess.TimeoutExpired) as e:
+                state.setText(f"Échec : {e}")
+        test.clicked.connect(run_test)
+        row.addWidget(ex)
+        row.addWidget(test)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addWidget(state)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec():
+            settings().setValue("journal/upload", edit.text().strip())
+            self.statusBar().showMessage(
+                "Envoi automatique du journal : "
+                + ("activé" if edit.text().strip() else "désactivé"), 6000)
 
     def show_session_report(self):
         if not self.list.count():
