@@ -36,6 +36,7 @@ import struct
 import unicodedata
 import subprocess
 import shlex
+import time
 import functools
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -2525,6 +2526,206 @@ def quick_stack(items, ref, progress=None):
             "gain": (n1 / ns) if n1 and ns else None,
             "rejected": rejected / float(stack.size * len(items)) if stack.size else 0.0,
             "exposure": None, "header": rheader}
+
+
+# ----------------------------------------------------------------------------
+# Résolution astrométrique de l'aperçu (ASTAP ou Siril, installés à part)
+# ----------------------------------------------------------------------------
+
+def find_astap():
+    for name in ("astap_cli", "astap"):
+        exe = shutil.which(name)
+        if exe:
+            return [exe]
+    for path in ("/opt/astap/astap_cli", "/opt/astap/astap",
+                 os.path.expanduser("~/astap/astap_cli")):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return [path]
+    return None
+
+
+def solve_hints(header, factor, shape):
+    """Indications pour le solveur : centre (RA, DEC en degrés), échelle de
+    l'aperçu (″/px) et hauteur du champ (°). Valeurs absentes : None."""
+    ra = parse_angle(header.get("RA"))
+    if ra is None:
+        ra = parse_angle(header.get("OBJCTRA"), hours=True)
+    dec = parse_angle(header.get("DEC"))
+    if dec is None:
+        dec = parse_angle(header.get("OBJCTDEC"))
+    sc = pixel_scale(header)
+    if sc is None:                       # Dwarf : FOCAL au lieu de FOCALLEN
+        try:
+            pix = float(header.get("XPIXSZ") or 0)
+            foc = float(header.get("FOCAL") or 0)
+            sc = 206.265 * pix / foc if pix > 0 and foc > 0 else None
+        except (TypeError, ValueError):
+            sc = None
+    scale = sc * factor if sc else None
+    return {"ra": ra, "dec": dec, "scale": scale,
+            "fov_h": scale * shape[0] / 3600.0 if scale else None}
+
+
+def wcs_from_header(h):
+    """Solution WCS (projection TAN) d'un en-tête FITS ou d'un .ini d'ASTAP."""
+    def f(k, d=None):
+        v = h.get(k, d)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    c1, c2, p1, p2 = f("CRVAL1"), f("CRVAL2"), f("CRPIX1"), f("CRPIX2")
+    if None in (c1, c2, p1, p2):
+        return None
+    cd = [[f("CD1_1"), f("CD1_2")], [f("CD2_1"), f("CD2_2")]]
+    if None in cd[0] + cd[1]:
+        d1, d2, rot = f("CDELT1"), f("CDELT2"), f("CROTA2", 0.0) or 0.0
+        if not d1 or not d2:
+            return None
+        t = np.radians(rot)
+        cd = [[d1 * np.cos(t), -d2 * np.sin(t)], [d1 * np.sin(t), d2 * np.cos(t)]]
+    return {"crval": (c1, c2), "crpix": (p1, p2), "cd": np.array(cd, dtype=np.float64)}
+
+
+def wcs_pix_to_world(w, x, y):
+    """Pixel FITS (1 = premier pixel) -> (RA, DEC) en degrés."""
+    dx, dy = np.asarray(x, float) - w["crpix"][0], np.asarray(y, float) - w["crpix"][1]
+    xi = np.radians(w["cd"][0, 0] * dx + w["cd"][0, 1] * dy)
+    eta = np.radians(w["cd"][1, 0] * dx + w["cd"][1, 1] * dy)
+    a0, d0 = np.radians(w["crval"][0]), np.radians(w["crval"][1])
+    den = np.cos(d0) - eta * np.sin(d0)
+    ra = a0 + np.arctan2(xi, den)
+    dec = np.arctan2(np.sin(d0) + eta * np.cos(d0), np.hypot(xi, den))
+    return np.degrees(ra) % 360.0, np.degrees(dec)
+
+
+def wcs_world_to_pix(w, ra, dec):
+    """(RA, DEC) en degrés -> pixel FITS ; NaN derrière le plan tangent."""
+    a, d = np.radians(np.asarray(ra, float)), np.radians(np.asarray(dec, float))
+    a0, d0 = np.radians(w["crval"][0]), np.radians(w["crval"][1])
+    cosc = np.sin(d0) * np.sin(d) + np.cos(d0) * np.cos(d) * np.cos(a - a0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = np.cos(d) * np.sin(a - a0) / cosc
+        eta = (np.cos(d0) * np.sin(d) - np.sin(d0) * np.cos(d) * np.cos(a - a0)) / cosc
+    inv = np.linalg.inv(w["cd"])
+    xi, eta = np.degrees(xi), np.degrees(eta)
+    x = inv[0, 0] * xi + inv[0, 1] * eta + w["crpix"][0]
+    y = inv[1, 0] * xi + inv[1, 1] * eta + w["crpix"][1]
+    bad = cosc <= 0
+    return np.where(bad, np.nan, x), np.where(bad, np.nan, y)
+
+
+def wcs_summary(w, shape, factor=1):
+    """Centre, échelle, champ et orientation d'une solution (aperçu réduit
+    d'un facteur factor par rapport aux fichiers)."""
+    h, wid = shape
+    ra, dec = wcs_pix_to_world(w, (wid + 1) / 2.0, (h + 1) / 2.0)
+    cd = w["cd"]
+    scale = float(np.sqrt(abs(np.linalg.det(cd)))) * 3600.0      # ″/px aperçu
+    # angle de position du nord : direction du nord dans l'image, mesurée
+    # depuis le haut du fichier vers l'est (convention CROTA2 d'ASTAP)
+    angle = float(np.degrees(np.arctan2(-cd[0, 1], cd[1, 1])))
+    return {"ra": float(ra), "dec": float(dec), "scale": scale,
+            "scale_file": scale / factor, "fov": (scale * wid / 3600.0, scale * h / 3600.0),
+            "angle": (angle + 180.0) % 360.0 - 180.0,
+            "mirrored": bool(np.linalg.det(cd) > 0)}
+
+
+def ra_text(ra):
+    h = (ra / 15.0) % 24.0
+    H = int(h); m = (h - H) * 60; M = int(m); S = int(round((m - M) * 60))
+    if S == 60:
+        S, M = 0, M + 1
+    if M == 60:
+        M, H = 0, (H + 1) % 24
+    return f"{H}h {M:02d}m {S:02d}s"
+
+
+def dec_text(dec):
+    sg = "−" if dec < 0 else "+"
+    a = abs(dec); D = int(a); m = int(round((a - D) * 60))
+    if m == 60:
+        D, m = D + 1, 0
+    return f"{sg}{D}° {m:02d}′"
+
+
+def grid_lines(w, shape):
+    """Lignes de RA et de DEC traversant l'image : [(type, valeur, [(x, y)])]
+    en pixels FITS ; pas choisi selon le champ."""
+    h, wid = shape
+    s = wcs_summary(w, shape)
+    span = max(s["fov"])
+    step = next((v for v in (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10) if span / v <= 6), 15)
+    cosd = max(0.15, np.cos(np.radians(s["dec"])))
+    rstep = next((v for v in (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30)
+                  if v >= step / cosd * 0.8), 30)
+    out = []
+    reach = span * 0.9 + 0.1
+    for k in np.arange(np.floor((s["dec"] - reach) / step), np.ceil((s["dec"] + reach) / step) + 1):
+        d = k * step
+        if abs(d) >= 90:
+            continue
+        ras = s["ra"] + np.linspace(-reach / cosd, reach / cosd, 80)
+        x, y = wcs_world_to_pix(w, ras, np.full(80, d))
+        out.append(("dec", d, list(zip(x, y))))
+    for k in np.arange(np.floor((s["ra"] - reach / cosd) / rstep), np.ceil((s["ra"] + reach / cosd) / rstep) + 1):
+        r = (k * rstep) % 360.0
+        decs = np.clip(s["dec"] + np.linspace(-reach, reach, 80), -89.9, 89.9)
+        x, y = wcs_world_to_pix(w, np.full(80, r), decs)
+        out.append(("ra", r, list(zip(x, y))))
+    return out
+
+
+def solver_command(solver, path, hints):
+    """Commande du solveur. solver : ("astap", cmd) ou ("siril", cmd)."""
+    kind, cmd = solver
+    if kind == "astap":
+        args = cmd + ["-f", path, "-r", "30" if hints.get("ra") is not None else "180",
+                      "-z", "0", "-wcs"]
+        if hints.get("ra") is not None and hints.get("dec") is not None:
+            args += ["-ra", f"{hints['ra'] / 15.0:.6f}", "-spd", f"{hints['dec'] + 90.0:.6f}"]
+        if hints.get("fov_h"):
+            args += ["-fov", f"{hints['fov_h']:.4f}"]
+        return args, None
+    # Siril : script qui charge, résout et enregistre l'image avec sa solution
+    folder = os.path.dirname(path)
+    name = os.path.splitext(os.path.basename(path))[0]
+    opts = "-force"
+    if hints.get("scale"):
+        # focale fictive cohérente avec l'échelle de l'aperçu, pixels de 10 µm
+        opts += f" -focal={206.265 * 10.0 / hints['scale']:.2f} -pixelsize=10"
+    if hints.get("ra") is not None and hints.get("dec") is not None:
+        opts = f"{hints['ra']:.5f},{hints['dec']:.5f} " + opts
+    script = os.path.join(folder, name + "_solve.ssf")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(f"requires 1.2.0\ncd \"{folder}\"\nload \"{name}\"\n"
+                f"platesolve {opts}\nsave \"{name}_solved\"\n")
+    return cmd + ["-d", folder, "-s", script], os.path.join(folder, name + "_solved.fit")
+
+
+def read_solution(kind, path, solved):
+    """Lit la solution écrite par le solveur ; None si l'image n'est pas résolue."""
+    if kind == "astap":
+        ini = os.path.splitext(path)[0] + ".ini"
+        try:
+            vals = {}
+            with open(ini, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        vals[k.strip().upper()] = v.strip()
+        except OSError:
+            return None
+        if vals.get("PLTSOLVD", "F").upper() not in ("T", "TRUE", "1"):
+            return None
+        return wcs_from_header(vals)
+    for cand in (solved, solved + "s", solved[:-4] + ".fits"):
+        if cand and os.path.exists(cand):
+            try:
+                return wcs_from_header(fits.getheader(cand))
+            except Exception:   # noqa: BLE001
+                return None
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -6694,6 +6895,68 @@ class MainWindow(QMainWindow):
         res["exposure"] = sum(exps)
         self.show_quick_stack(res)
 
+    def run_plate_solve(self, res, parent=None):
+        """Résout l'aperçu avec ASTAP (ou Siril). Renvoie (solution, message)."""
+        solver = ("astap", find_astap()) if find_astap() else (("siril", find_siril()) if find_siril() else None)
+        if not solver:
+            return None, ("Aucun solveur trouvé. Installez ASTAP (gratuit, hors ligne) : "
+                          "le paquet astap_amd64.deb et la base d'étoiles D50 sur "
+                          "www.hnsky.org/astap.htm, puis « sudo apt install "
+                          "./astap_amd64.deb ./d50_star_database.deb ». Siril "
+                          "(siril-cli) fonctionne aussi, avec une connexion internet.")
+        folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                              APP_ID, "astrometrie")
+        os.makedirs(folder, exist_ok=True)
+        for old in os.listdir(folder):
+            try:
+                os.remove(os.path.join(folder, old))
+            except OSError:
+                pass
+        path = os.path.join(folder, "apercu.fit")
+        a = res["stack"]
+        mono = a.mean(axis=2) if a.ndim == 3 else a
+        hdr = fits.Header()
+        for k in ("OBJECT", "DATE-OBS", "RA", "DEC", "OBJCTRA", "OBJCTDEC"):
+            if k in res["header"]:
+                hdr[k] = res["header"][k]
+        fits.PrimaryHDU(data=np.ascontiguousarray(mono, dtype=np.float32), header=hdr).writeto(path, overwrite=True)
+        hints = solve_hints(res["header"], res["scale"], mono.shape)
+        cmd, solved = solver_command(solver, path, hints)
+        name = "ASTAP" if solver[0] == "astap" else "Siril"
+        prog = QProgressDialog(f"Résolution astrométrique avec {name}…", "Annuler", 0, 0, parent or self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, cwd=folder)
+        except OSError as e:
+            prog.close()
+            return None, f"Impossible de lancer {name} : {e}"
+        t0 = datetime.now()
+        while proc.poll() is None:
+            QApplication.processEvents()
+            if prog.wasCanceled() or (datetime.now() - t0).total_seconds() > 240:
+                proc.kill()
+                proc.wait()
+                break
+            time.sleep(0.1)
+        prog.close()
+        out = proc.stdout.read() if proc.stdout else ""
+        wcs = read_solution(solver[0], path, solved)
+        if not wcs:
+            last = [l for l in out.strip().splitlines() if l.strip()][-3:]
+            return None, ("Pas de solution. " + (
+                "Vérifiez que la base d'étoiles d'ASTAP couvre ce champ (D50 au-delà de 0,5°). "
+                if solver[0] == "astap" else "Siril a-t-il accès à internet (catalogue en ligne) ? ")
+                + ("Fin du journal : " + " / ".join(last) if last else ""))
+        s = wcs_summary(wcs, res["stack"].shape[:2], res["scale"])
+        return wcs, (f"Centre : RA {ra_text(s['ra'])}, DEC {dec_text(s['dec'])} · "
+                     f"échelle {fr(s['scale_file'], 2)}″/px dans les brutes · champ "
+                     f"{fr(s['fov'][0], 2)}° × {fr(s['fov'][1], 2)}° · angle de position "
+                     f"{fr(s['angle'], 1)}° (convention ASTAP)"
+                     + (" · image en miroir" if s["mirrored"] else "")
+                     + f". Résolu par {name} ; la solution est ajoutée au FITS enregistré.")
+
     def light_order_pairs(self, pairs):
         order = self.light_order([s for s, _t in pairs])
         d = dict(pairs)
@@ -6721,7 +6984,7 @@ class MainWindow(QMainWindow):
                 if flip:
                     img8 = img8[::-1]
                 cache[key] = QPixmap.fromImage(numpy_to_qimage(np.ascontiguousarray(img8)))
-            pm = cache[key]
+            pm = cache[key] if key == "all" else overlay(cache[key])   # « all » : autre recadrage
             view.setPixmap(pm.scaled(view.width(), view.height(),
                                      Qt.AspectRatioMode.KeepAspectRatio,
                                      Qt.TransformationMode.SmoothTransformation))
@@ -6773,6 +7036,14 @@ class MainWindow(QMainWindow):
                 if k in first:
                     hdr[k] = first[k]
             hdr["NCOMBINE"] = res["n"]
+            if state.get("wcs"):
+                wcs = state["wcs"]
+                hdr["CTYPE1"], hdr["CTYPE2"] = "RA---TAN", "DEC--TAN"
+                hdr["CRVAL1"], hdr["CRVAL2"] = wcs["crval"]
+                hdr["CRPIX1"], hdr["CRPIX2"] = wcs["crpix"]
+                for i in range(2):
+                    for j in range(2):
+                        hdr[f"CD{i + 1}_{j + 1}"] = float(wcs["cd"][i, j])
             hdr["HISTORY"] = "AstroCheck : apercu d'empilement rapide (reduit)"
             fits.PrimaryHDU(data=np.ascontiguousarray(arr, dtype=np.float32),
                             header=hdr).writeto(path, overwrite=True)
@@ -6784,7 +7055,85 @@ class MainWindow(QMainWindow):
         brow.addStretch(1)
         brow.addWidget(close)
         lay.addLayout(brow)
-        dlg.resize(1000, 780)
+        # résolution astrométrique : grille RA/DEC et boussole
+        solve_row = QHBoxLayout()
+        solve_btn = QPushButton("Résolution astrométrique")
+        grid_cb = QCheckBox("Grille RA/DEC et boussole")
+        grid_cb.setEnabled(False)
+        solve_info = QLabel("")
+        solve_info.setWordWrap(True)
+        solve_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        solve_row.addWidget(solve_btn)
+        solve_row.addWidget(grid_cb)
+        solve_row.addStretch(1)
+        lay.insertLayout(2, solve_row)
+        lay.insertWidget(3, solve_info)
+
+        def overlay(pm):
+            """Dessine la grille et la boussole sur une copie du pixmap."""
+            wcs = state.get("wcs")
+            if not wcs or not grid_cb.isChecked():
+                return pm
+            pm = pm.copy()
+            h, w = res["stack"].shape[:2]
+            def disp(x, y):                       # pixel FITS -> pixel affiché
+                col, row = x - 1.0, y - 1.0
+                return col, (h - 1 - row) if flip else row
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor(120, 200, 255, 150), max(1.0, w / 900.0))
+            p.setPen(pen)
+            font = p.font()
+            font.setPixelSize(max(11, int(w / 70)))
+            p.setFont(font)
+            for kind, val, pts in grid_lines(wcs, (h, w)):
+                prev, label_at = None, None
+                for x, y in pts:
+                    if not (np.isfinite(x) and np.isfinite(y)) or not (-w < x < 2 * w and -h < y < 2 * h):
+                        prev = None
+                        continue
+                    cx, cy = disp(x, y)
+                    if prev is not None:
+                        p.drawLine(QPointF(*prev), QPointF(cx, cy))
+                    if 4 < cx < w - 60 and 14 < cy < h - 4 and label_at is None:
+                        label_at = (cx, cy)
+                    prev = (cx, cy)
+                if label_at:
+                    p.setPen(QColor(170, 225, 255, 220))
+                    p.drawText(QPointF(label_at[0] + 3, label_at[1] - 3),
+                               dec_text(val) if kind == "dec" else ra_text(val).rsplit(" ", 1)[0])
+                    p.setPen(pen)
+            # boussole : nord et est, dans le coin haut gauche
+            s = wcs_summary(wcs, (h, w))
+            x0, y0 = wcs_world_to_pix(wcs, s["ra"], s["dec"])
+            d = max(s["fov"]) / 12.0
+            xn, yn = wcs_world_to_pix(wcs, s["ra"], s["dec"] + d)
+            xe, ye = wcs_world_to_pix(wcs, s["ra"] + d / max(0.15, np.cos(np.radians(s["dec"]))), s["dec"])
+            c0 = disp(float(x0), float(y0))
+            L = w / 12.0
+            ox, oy = L * 1.3, L * 1.3
+            p.setPen(QPen(QColor(255, 200, 80, 230), max(1.5, w / 600.0)))
+            for (xx, yy), name in (((xn, yn), "N"), ((xe, ye), "E")):
+                cx, cy = disp(float(xx), float(yy))
+                vx, vy = cx - c0[0], cy - c0[1]
+                n = float(np.hypot(vx, vy)) or 1.0
+                ex, ey = ox + vx / n * L, oy + vy / n * L
+                p.drawLine(QPointF(ox, oy), QPointF(ex, ey))
+                p.drawText(QPointF(ex + vx / n * 8 - 5, ey + vy / n * 8 + 5), name)
+            p.end()
+            return pm
+
+        def do_solve():
+            wcs, msg = self.run_plate_solve(res, dlg)
+            solve_info.setText(msg)
+            if wcs:
+                state["wcs"] = wcs
+                grid_cb.setEnabled(True)
+                grid_cb.setChecked(True)
+                render(state["k"])
+        solve_btn.clicked.connect(do_solve)
+        grid_cb.toggled.connect(lambda _on: render(state["k"]))
+        dlg.resize(1000, 820)
         buttons[0].setChecked(True)
 
         def on_resize(e, base=dlg.resizeEvent):

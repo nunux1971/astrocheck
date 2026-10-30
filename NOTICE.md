@@ -364,6 +364,16 @@ Pendant l'analyse, AstroCheck cherche les traînées rectilignes qui traversent 
 - elle indique de combien le bruit du fond a baissé (au mieux √N pour N images), le temps de pose gardé et la part de pixels rejetés ;
 - **Enregistrer l'empilement (FITS)…** garde l'aperçu en 32 bits.
 
+**Résolution astrométrique.** Le bouton **Résolution astrométrique** de la fenêtre d'aperçu identifie le champ : centre en RA/DEC, échelle des brutes en ″/px, taille du champ, angle de position (même convention qu'ASTAP) et image en miroir ou non. La case **Grille RA/DEC et boussole** superpose la grille de coordonnées et les directions du nord et de l'est. La solution est ajoutée au FITS enregistré.
+
+AstroCheck utilise **ASTAP**, gratuit et hors ligne. Téléchargez sur [hnsky.org/astap.htm](https://www.hnsky.org/astap.htm) le programme `astap_amd64.deb` et la base d'étoiles `d50_star_database.deb` (champs de plus de 0,5°), puis :
+
+```bash
+sudo apt install ./astap_amd64.deb ./d50_star_database.deb
+```
+
+Sans ASTAP, AstroCheck essaie Siril (`siril-cli`), qui résout avec un catalogue en ligne. Le centre approximatif (mots-clés RA et DEC) et l'échelle (focale et taille des pixels) de l'en-tête accélèrent la recherche : le Dwarf 3 et l'ASIAIR les écrivent.
+
 C'est un aperçu, sans darks ni flats et en taille réduite : l'empilement final se fait toujours dans Siril. Les séries planétaires (vidéos) ne sont pas concernées : elles s'alignent sur la planète, pas sur les étoiles.
 
 ### Journal des cibles pour AstroPlan
