@@ -354,6 +354,18 @@ La hauteur de l'objet se calcule à partir de RA et DEC dans l'en-tête, de la d
 
 Pendant l'analyse, AstroCheck cherche les traînées rectilignes qui traversent l'image. Une image concernée affiche « traînée » dans la colonne Raison, mais n'est pas rejetée : la réjection des pixels à l'empilement (sigma clipping) efface en général ces traînées, d'autant mieux que les images sont nombreuses. Les aigrettes de diffraction des étoiles brillantes et les nébuleuses ne sont pas prises pour des traînées. Une traînée très faible ou très courte peut passer inaperçue.
 
+### Aperçu d'empilement rapide
+
+**Analyse ▸ Aperçu d'empilement rapide…** (Ctrl+Maj+A) empile en quelques secondes les brutes **gardées** de la série affichée, pour juger le résultat avant de lancer Siril :
+
+- les images sont réduites (environ 1 000 pixels de large), alignées sur les étoiles avec la même méthode que la rotation de champ, ramenées au même niveau de fond, puis moyennées en rejetant les pixels aberrants : traînées de satellites, rayons cosmiques, pixels chauds ;
+- au-delà de 40 brutes, 40 images réparties sur toute la série sont utilisées ;
+- la fenêtre montre l'**empilement**, **une seule image** (la référence) et, si vous cochez la case, l'**empilement avec les rejetées**, pour voir si votre tri améliore vraiment le résultat ;
+- elle indique de combien le bruit du fond a baissé (au mieux √N pour N images), le temps de pose gardé et la part de pixels rejetés ;
+- **Enregistrer l'empilement (FITS)…** garde l'aperçu en 32 bits.
+
+C'est un aperçu, sans darks ni flats et en taille réduite : l'empilement final se fait toujours dans Siril. Les séries planétaires (vidéos) ne sont pas concernées : elles s'alignent sur la planète, pas sur les étoiles.
+
 ### Journal des cibles pour AstroPlan
 
 AstroCheck tient un **journal** de vos séances : pour chaque cible, chaque nuit et chaque série (caméra, filtre, pose, gain), le nombre de brutes, combien vous en avez gardé, le temps de pose gardé et la FWHM médiane. AstroPlan lit ce journal et affiche, cible par cible, le temps déjà accumulé face au temps conseillé, et le nombre de nuits qu'il reste à faire.
@@ -555,6 +567,7 @@ Cette commande sert aussi à extraire quelques images d'un SER, ou à le convert
 | Ctrl+Maj+K | Contrôle des darks |
 | Ctrl+B | Bilan de la séance |
 | Ctrl+Maj+F | Contrôle des flats |
+| Ctrl+Maj+A | Aperçu d'empilement rapide |
 | Ctrl+J | Mettre à jour le journal AstroPlan |
 | Molette | Zoomer / dézoomer |
 | Ctrl+R | Analyser et classer les images |
