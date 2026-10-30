@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Exports et essais
+traitement/
+rejetes/
+*.ssf
+mesures.csv
+astrocheck_resume.txt
