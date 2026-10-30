@@ -2385,6 +2385,135 @@ def align_series(stars, order, ref):
 
 
 # ----------------------------------------------------------------------------
+# Aperçu d'empilement rapide (réduit, aligné sur les étoiles, sigma-clipping)
+# ----------------------------------------------------------------------------
+
+QS_MAX_W = 1100      # largeur maximale de l'aperçu (pixels)
+QS_MAX_N = 40        # nombre maximal d'images empilées (réparties dans la série)
+
+
+def qs_prepare(data, header):
+    """Image réduite (float32, H×W×C) et facteur d'échelle vers le fichier :
+    super-pixel pour une image bayer, puis binning 2×2 jusqu'à QS_MAX_W."""
+    bayer = str(header.get("BAYERPAT", "") or "").strip().upper()
+    scale = 1
+    if data.ndim == 2 and bayer in BAYER_PATTERNS:
+        img, scale = debayer_superpixel(data.astype(np.float32), bayer), 2
+    elif data.ndim == 2:
+        img = data.astype(np.float32)[..., None]
+    else:
+        img = data.astype(np.float32)
+    while img.shape[1] > QS_MAX_W:
+        img = np.dstack([bin2(img[..., c]) for c in range(img.shape[2])])
+        scale *= 2
+    return np.ascontiguousarray(img), scale
+
+
+def qs_warp(img, tr, scale, shape):
+    """Rééchantillonne img (repère de son fichier, réduit d'un facteur scale)
+    dans le repère réduit de la référence, par interpolation bilinéaire.
+    tr : p_ref = R(angle) · p_img + (dx, dy), en pixels des fichiers.
+    Les pixels hors de l'image valent NaN."""
+    h, w = shape
+    v, u = np.mgrid[0:h, 0:w].astype(np.float64)
+    X, Y = (u + 0.5) * scale - 0.5, (v + 0.5) * scale - 0.5
+    if tr:
+        a = np.radians(tr["angle"])
+        c, s_ = np.cos(a), np.sin(a)
+        X, Y = X - tr["dx"], Y - tr["dy"]
+        X, Y = X * c + Y * s_, -X * s_ + Y * c      # rotation de −angle
+    x, y = (X + 0.5) / scale - 0.5, (Y + 0.5) / scale - 0.5
+    hi, wi = img.shape[:2]
+    ok = (x >= 0) & (y >= 0) & (x <= wi - 1) & (y <= hi - 1)
+    x0 = np.clip(np.floor(x).astype(np.int64), 0, wi - 2)
+    y0 = np.clip(np.floor(y).astype(np.int64), 0, hi - 2)
+    fx, fy = (x - x0)[..., None], (y - y0)[..., None]
+    out = (img[y0, x0] * (1 - fx) * (1 - fy) + img[y0, x0 + 1] * fx * (1 - fy)
+           + img[y0 + 1, x0] * (1 - fx) * fy + img[y0 + 1, x0 + 1] * fx * fy)
+    out[~ok] = np.nan
+    return out.astype(np.float32)
+
+
+def qs_combine(cube, kappa=3.0):
+    """Moyenne avec rejet des pixels aberrants (sigma-clipping par rapport à
+    la médiane), par bandes de lignes pour limiter la mémoire.
+    cube : N×H×W×C (float16 ou float32, NaN hors champ).
+    Renvoie (image, nombre d'images par pixel, nombre de pixels rejetés)."""
+    import warnings
+    n, h, w, c = cube.shape
+    out = np.zeros((h, w, c), dtype=np.float32)
+    count = np.zeros((h, w), dtype=np.int16)
+    rejected = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for r0 in range(0, h, 48):
+            blk = cube[:, r0:r0 + 48].astype(np.float32)
+            med = np.nanmedian(blk, axis=0)
+            if n >= 4:
+                mad = np.nanmedian(np.abs(blk - med), axis=0) * 1.4826
+                bad = np.abs(blk - med) > kappa * mad + 1e-6
+                rejected += int(np.count_nonzero(bad & ~np.isnan(blk)))
+                blk[bad] = np.nan
+            out[r0:r0 + 48] = np.nan_to_num(np.nanmean(blk, axis=0))
+            count[r0:r0 + 48] = np.sum(~np.isnan(blk[..., 0]), axis=0)
+    return out, count, rejected
+
+
+def qs_noise(img):
+    """Bruit de fond robuste (MAD des différences entre pixels voisins)."""
+    mono = img.mean(axis=2) if img.ndim == 3 else img
+    d = (mono[:, 1:] - mono[:, :-1])[::2, ::2]
+    d = d[np.isfinite(d)]
+    if not d.size:
+        return None
+    return float(np.median(np.abs(d - np.median(d)))) * 1.4826 / np.sqrt(2.0)
+
+
+def quick_stack(items, ref, progress=None):
+    """Empile rapidement les images. items : [(source, transformation)] ;
+    ref : source de référence (repère de sortie). Renvoie un dict avec
+    l'image empilée, l'image de référence seule et des statistiques."""
+    if not items:
+        raise ValueError("aucune image à empiler")
+    if len(items) > QS_MAX_N:                  # images réparties dans la série
+        idx = np.linspace(0, len(items) - 1, QS_MAX_N).round().astype(int)
+        items = [items[i] for i in sorted(set(idx))]
+    rdata, rheader, _ = read_source(ref)
+    rimg, scale = qs_prepare(rdata, rheader)
+    shape = rimg.shape[:2]
+    cube = np.empty((len(items),) + rimg.shape, dtype=np.float16)
+    level = np.nanmedian(rimg.reshape(-1, rimg.shape[2]), axis=0)
+    for i, (src, tr) in enumerate(items):
+        if progress and not progress(i, src):
+            raise Cancelled()
+        data, header, _ = read_source(src)
+        img, sc = qs_prepare(data, header)
+        if img.shape[2] != rimg.shape[2]:
+            raise ValueError(f"{src_name(src)} : couleur différente de la référence")
+        warped = qs_warp(img, None if src == ref else tr, sc, shape)
+        # même niveau de fond que la référence (le ciel change pendant la nuit)
+        med = np.nanmedian(warped.reshape(-1, warped.shape[2]), axis=0)
+        cube[i] = warped - med + level
+    stack, count, rejected = qs_combine(cube)
+    # rognage : zone couverte par au moins 90 % des images
+    full = count >= max(1, int(0.9 * len(items)))
+    rows, cols = np.nonzero(full.any(axis=1))[0], np.nonzero(full.any(axis=0))[0]
+    crop = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1)) \
+        if len(rows) and len(cols) else (slice(None), slice(None))
+    stack, single = stack[crop], rimg[crop]
+    # bruit d'une image seule après rééchantillonnage (l'interpolation lisse
+    # un peu le bruit : on compare à des images traitées comme l'empilement)
+    picks = [i for i, (src, _t) in enumerate(items) if src != ref][:6] or [0]
+    n1 = _median([qs_noise(cube[i][crop].astype(np.float32)) for i in picks])
+    ns = qs_noise(stack)
+    return {"stack": stack, "single": single, "n": len(items), "scale": scale,
+            "noise_single": n1, "noise_stack": ns,
+            "gain": (n1 / ns) if n1 and ns else None,
+            "rejected": rejected / float(stack.size * len(items)) if stack.size else 0.0,
+            "exposure": None, "header": rheader}
+
+
+# ----------------------------------------------------------------------------
 # Bande étroite : Ha et OIII à partir d'un empilement couleur
 # ----------------------------------------------------------------------------
 
@@ -3835,6 +3964,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         self._action(m, "Bilan de la séance…", self.show_session_report,
                      "Ctrl+B")
+        self._action(m, "Aperçu d'empilement rapide…",
+                     self.quick_stack_preview, "Ctrl+Shift+A")
         self._action(m, "Mettre à jour le journal AstroPlan",
                      self.update_journal, "Ctrl+J")
         self._action(m, "Envoi automatique du journal au serveur…",
@@ -6458,6 +6589,179 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Envoi automatique du journal : "
                 + ("activé" if edit.text().strip() else "désactivé"), 6000)
+
+    # -- aperçu d'empilement rapide
+    def quick_stack_preview(self):
+        """Empile rapidement les brutes gardées de la série (réduites,
+        alignées sur les étoiles) pour juger la série avant Siril."""
+        if getattr(self, "planet", False):
+            QMessageBox.information(
+                self, APP_NAME, "Série planétaire : l'aperçu d'empilement aligne "
+                "sur les étoiles. Pour les planètes, utilisez AutoStakkert!.")
+            return
+        self.update_geometry(force=True)
+        lights = [it for it in self.working_items() if self.item_type(it) == "light"]
+        kept = [it for it in lights if not it.data(0, ROLE_REJ)]
+        if self.ref is None or not self.transforms:
+            QMessageBox.information(
+                self, APP_NAME, "Il faut d'abord mesurer la série : les étoiles "
+                "servent à aligner les images. Attendez la fin des mesures, "
+                "puis relancez l'aperçu.")
+            return
+        def usable(its):
+            out = []
+            for it in its:
+                src = it.data(0, ROLE_SRC)
+                if src == self.ref or self.transforms.get(src):
+                    out.append((src, self.transforms.get(src)))
+            return [x for x in self.light_order_pairs(out)]
+        k_items, a_items = usable(kept), usable(lights)
+        skipped = len(kept) - len(k_items)
+        if len(k_items) < 2:
+            QMessageBox.information(self, APP_NAME, "Pas assez d'images gardées "
+                                    "et alignées pour un empilement.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Aperçu d'empilement rapide")
+        form = QVBoxLayout(dlg)
+        n_rej = len(a_items) - len(k_items)
+        lbl = QLabel(f"{len(k_items)} brute(s) gardée(s) et alignée(s)"
+                     + (f", {skipped} non alignée(s) laissée(s) de côté" if skipped else "")
+                     + (f". Au-delà de {QS_MAX_N}, {QS_MAX_N} images réparties dans "
+                        "la série sont utilisées." if len(k_items) > QS_MAX_N else ".")
+                     + "\nImages réduites (largeur ≈ 1 000 px), alignées sur les "
+                     "étoiles, moyenne avec rejet des pixels aberrants (traînées).")
+        lbl.setWordWrap(True)
+        form.addWidget(lbl)
+        cmp_all = QCheckBox(f"Empiler aussi avec les {n_rej} rejetée(s), pour comparer")
+        cmp_all.setChecked(False)
+        cmp_all.setEnabled(n_rej > 0)
+        form.addWidget(cmp_all)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addWidget(bb)
+        if not dlg.exec():
+            return
+        want_all = cmp_all.isChecked() and n_rej > 0
+        total = min(len(k_items), QS_MAX_N) + (min(len(a_items), QS_MAX_N) if want_all else 0)
+        srcs = [s for s, _t in k_items] + ([s for s, _t in a_items] if want_all else [])
+
+        def work(progress):
+            res = quick_stack(k_items, self.ref, progress)
+            if want_all:
+                off = res["n"]
+                res["all"] = quick_stack(a_items, self.ref,
+                                         lambda i, src: progress(off + i, src))
+            return res
+        res = self.run_with_progress("Empilement rapide", srcs[:total], work)
+        if not res:
+            return
+        exps = [((self.find_item(s).data(0, ROLE_META) or {}).get("exptime") or 0)
+                for s, _t in k_items]
+        res["exposure"] = sum(exps)
+        self.show_quick_stack(res)
+
+    def light_order_pairs(self, pairs):
+        order = self.light_order([s for s, _t in pairs])
+        d = dict(pairs)
+        return [(s, d[s]) for s in order]
+
+    def show_quick_stack(self, res):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Aperçu d'empilement rapide")
+        lay = QVBoxLayout(dlg)
+        view = QLabel()
+        view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        view.setMinimumSize(640, 420)
+        lay.addWidget(view, 1)
+        flip = self.mirrored()
+        params = ("stf", -2.8, 0.25)
+        cache, state = {}, {"k": "stack"}
+
+        def render(key):
+            state["k"] = key
+            if key not in cache:
+                a = res["all"]["stack"] if key == "all" else res[key]
+                ch = [stretch(a[..., c].copy(), params) for c in range(a.shape[2])]
+                img = np.dstack(ch) if len(ch) == 3 else ch[0]
+                img8 = (img * 255.0 + 0.5).astype(np.uint8)
+                if flip:
+                    img8 = img8[::-1]
+                cache[key] = QPixmap.fromImage(numpy_to_qimage(np.ascontiguousarray(img8)))
+            pm = cache[key]
+            view.setPixmap(pm.scaled(view.width(), view.height(),
+                                     Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation))
+        row = QHBoxLayout()
+        choices = [("stack", f"Empilement ({res['n']} images)"),
+                   ("single", "Une seule image (référence)")]
+        if res.get("all"):
+            choices.append(("all", f"Avec les rejetées ({res['all']['n']} images)"))
+        buttons = []
+        for key, text in choices:
+            b = QRadioButton(text)
+            b.toggled.connect(lambda on, k=key: on and render(k))
+            row.addWidget(b)
+            buttons.append(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        info = []
+        if res.get("gain"):
+            info.append(f"Bruit du fond divisé par {res['gain']:.1f} par rapport à une "
+                        f"image seule (au mieux √{res['n']} = {np.sqrt(res['n']):.1f}).")
+        if res.get("exposure"):
+            info.append(f"Temps de pose gardé : {hm(res['exposure'])}.")
+        info.append(f"Pixels rejetés (traînées, rayons cosmiques, pixels chauds) : "
+                    f"{100 * res['rejected']:.2f} %.")
+        if res.get("all") and res["all"].get("gain") and res.get("gain"):
+            info.append("Avec les rejetées : bruit divisé par "
+                        f"{res['all']['gain']:.1f}. Comparez la finesse des étoiles "
+                        "et le fond : si l'image est plus douce ou plus sale, le tri "
+                        "était justifié.")
+        info.append("Aperçu réduit et sans calibration (darks, flats) : il sert à "
+                    "juger la série, pas à remplacer l'empilement dans Siril.")
+        txt = QLabel("\n".join(info))
+        txt.setWordWrap(True)
+        lay.addWidget(txt)
+        brow = QHBoxLayout()
+        save = QPushButton("Enregistrer l'empilement (FITS)…")
+
+        def do_save():
+            first = res["header"]
+            default = os.path.join(os.path.dirname(self.ref[0]), "apercu_empilement.fit")
+            path, _f = QFileDialog.getSaveFileName(dlg, "Enregistrer l'aperçu",
+                                                   default, "FITS (*.fit *.fits)")
+            if not path:
+                return
+            a = res["stack"]
+            arr = np.moveaxis(a, -1, 0) if a.shape[2] == 3 else a[..., 0]
+            hdr = fits.Header()
+            for k in ("OBJECT", "FILTER", "INSTRUME", "DATE-OBS", "ROWORDER"):
+                if k in first:
+                    hdr[k] = first[k]
+            hdr["NCOMBINE"] = res["n"]
+            hdr["HISTORY"] = "AstroCheck : apercu d'empilement rapide (reduit)"
+            fits.PrimaryHDU(data=np.ascontiguousarray(arr, dtype=np.float32),
+                            header=hdr).writeto(path, overwrite=True)
+            self.statusBar().showMessage(f"Aperçu enregistré : {path}", 8000)
+        save.clicked.connect(do_save)
+        close = QPushButton("Fermer")
+        close.clicked.connect(dlg.accept)
+        brow.addWidget(save)
+        brow.addStretch(1)
+        brow.addWidget(close)
+        lay.addLayout(brow)
+        dlg.resize(1000, 780)
+        buttons[0].setChecked(True)
+
+        def on_resize(e, base=dlg.resizeEvent):
+            base(e)
+            render(state["k"])
+        dlg.resizeEvent = on_resize              # image à la taille de la fenêtre
+        QTimer.singleShot(0, lambda: render(state["k"]))
+        dlg.exec()
 
     def show_session_report(self):
         if not self.list.count():

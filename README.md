@@ -19,6 +19,8 @@ Pensé pour l'ASIAIR et le **Dwarf 3**, il fonctionne avec tout logiciel d'acqui
 - **Choix de la référence** : meilleur score, image de votre choix, ou première image comme le Dwarf 3.
 - **Contrôle des darks et des flats** : pose, gain, température, lumière parasite, saturation, motif.
 - **Bilan de la séance** : coût du tri en signal/bruit, comparaison des nuits, dérive de la mise au point avec la température, traînées de satellites.
+- **Aperçu d'empilement rapide** : les brutes gardées alignées et empilées en quelques secondes, comparées à une image seule et à l'empilement avec les rejetées.
+- **Journal pour AstroPlan**, envoyé automatiquement sur le serveur si vous le souhaitez.
 - **Séries** : caméras TELE et WIDE du Dwarf 3, filtres, poses et gains traités séparément.
 - **Export** vers Siril ou PixInsight, avec script de prétraitement Siril, score en mot-clé FITS (`ACWEIGHT`) pour ImageIntegration, et compositions HOO / SHO synthétique pour les filtres bi-bande.
 
