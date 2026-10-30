@@ -30,6 +30,7 @@ import os
 import sys
 import shutil
 import csv
+import json
 import re
 import struct
 import unicodedata
@@ -1383,6 +1384,81 @@ def hm(seconds):
     return f"{h} h {mn:02d} min" if h else f"{mn} min"
 
 
+# ----------------------------------------------------------------------------
+# Journal des cibles (lu par AstroPlan)
+# ----------------------------------------------------------------------------
+
+def journal_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, APP_ID, "journal.json")
+
+
+def target_name(meta, path):
+    """Nom de la cible : mot-clé OBJECT, sinon nom du dossier ou du fichier
+    (Dwarf : DWARF_RAW_<cible>_EXP_… ; ASIAIR : Light_<cible>_300.0s_…)."""
+    obj = (meta or {}).get("object") or ""
+    if obj.strip():
+        return obj.strip()
+    folder = os.path.basename(os.path.dirname(path))
+    m = re.match(r"DWARF_RAW_(?:TELE_|WIDE_)?(.+?)_EXP_", folder, re.I)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"Light_(.+?)_\d+(?:\.\d+)?s", os.path.basename(path), re.I)
+    if m:
+        return m.group(1).strip()
+    return folder
+
+
+def journal_entries(rows):
+    """Une entrée par cible, nuit et série. rows : dicts avec object, date,
+    camera, filter, exptime, gain, focal, kept, fwhm."""
+    groups = OrderedDict()
+    for r in rows:
+        night = night_of(r.get("date"))
+        if not r.get("object") or night is None:
+            continue
+        key = (r["object"], night.isoformat(), r.get("camera") or "",
+               r.get("filter") or "", r.get("exptime"), r.get("gain"))
+        groups.setdefault(key, []).append(r)
+    out = []
+    for (obj, night, cam, filt, exp, gain), rs in groups.items():
+        kept = [r for r in rs if r["kept"]]
+        out.append({
+            "object": obj, "night": night, "camera": cam, "filter": filt,
+            "exptime": exp, "gain": gain,
+            "focal": next((r["focal"] for r in rs if r.get("focal")), None),
+            "n": len(rs), "kept": len(kept),
+            "exp_kept": round(sum(r.get("exptime") or 0 for r in kept), 1),
+            "fwhm": _median([r.get("fwhm") for r in kept]),
+            "updated": datetime.now().isoformat(timespec="seconds")})
+    return out
+
+
+def merge_journal(path, entries):
+    """Ajoute ou remplace les entrées dans le journal ; renvoie leur nombre."""
+    def key(e):
+        return (e.get("object"), e.get("night"), e.get("camera"),
+                e.get("filter"), e.get("exptime"), e.get("gain"))
+    old = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        old = data.get("entries", []) if isinstance(data, dict) else data
+    except (OSError, ValueError):
+        pass
+    merged = OrderedDict((key(e), e) for e in old if isinstance(e, dict))
+    for e in entries:
+        merged[key(e)] = e
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"app": APP_NAME, "version": 1,
+                   "entries": list(merged.values())}, f, ensure_ascii=False,
+                  indent=1)
+    os.replace(tmp, path)
+    return len(entries)
+
+
 def night_of(date):
     """Nuit d'observation : une image de 2 h du matin appartient à la nuit
     commencée la veille."""
@@ -1568,6 +1644,7 @@ def read_meta(path):
         meta["date_utc"] = utc
         meta["date"] = utc_to_local(utc)                  # DATE-OBS est en UTC
         meta["camera"] = str(h.get("CAMERA", "") or "").strip()
+        meta["focal"] = _num(h, "FOCALLEN")
         meta["instrument"] = str(h.get("INSTRUME", "") or "").strip()
         meta["object"] = str(h.get("OBJECT", "") or "").strip()
         meta["ra"] = parse_angle(h.get("RA"))
@@ -3742,6 +3819,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         self._action(m, "Bilan de la séance…", self.show_session_report,
                      "Ctrl+B")
+        self._action(m, "Mettre à jour le journal AstroPlan",
+                     self.update_journal, "Ctrl+J")
         self._action(m, "Rotation de champ et zone utile…",
                      self.show_geometry_report, "Ctrl+U")
         self._action(m, "Lieu d'observation…", self.site_dialog)
@@ -4594,6 +4673,7 @@ class MainWindow(QMainWindow):
             return
         if o["csv"]:
             self.write_csv(os.path.join(root, "mesures.csv"))
+        journal = self.update_journal(quiet=True)
         weight_note = ""
         if o.get("weight") and created.get("light"):
             group = next(g for t, g, _ in ordered if t == "light")
@@ -4642,6 +4722,8 @@ class MainWindow(QMainWindow):
             lines.append("\n" + report.split("\n", 2)[-1])
         if script_note:
             lines.append("\n" + script_note)
+        if journal:
+            lines.append(f"\nJournal AstroPlan mis à jour : {journal}")
         if weight_note:
             lines.append("\n" + weight_note + " Dans ImageIntegration : "
                          f"Weights = FITS keyword, Weight keyword = "
@@ -6192,6 +6274,55 @@ class MainWindow(QMainWindow):
                        "clipping) efface en général les traînées : inutile "
                        "de rejeter ces images si elles sont nombreuses.")
         return "\n".join(out)
+
+    def journal_rows(self):
+        rows = []
+        for it in self.all_items():
+            if self.item_type(it) != "light":
+                continue
+            src = it.data(0, ROLE_SRC)
+            meta = it.data(0, ROLE_META) or {}
+            m = self.measures.get(src) or {}
+            rows.append({"object": target_name(meta, src[0]),
+                         "date": meta.get("date"),
+                         "camera": meta.get("camera") or meta.get("instrument"),
+                         "filter": meta.get("filter"),
+                         "exptime": meta.get("exptime"), "gain": meta.get("gain"),
+                         "focal": meta.get("focal"), "fwhm": m.get("fwhm"),
+                         "kept": not it.data(0, ROLE_REJ)})
+        return rows
+
+    def update_journal(self, quiet=False):
+        """Écrit le bilan de chaque cible, nuit et série dans le journal
+        lu par AstroPlan."""
+        entries = journal_entries(self.journal_rows())
+        if not entries:
+            if not quiet:
+                QMessageBox.information(
+                    self, APP_NAME, "Aucune brute datée dans la liste : le "
+                    "journal a besoin de la date de prise de vue (DATE-OBS).")
+            return None
+        path = journal_path()
+        try:
+            merge_journal(path, entries)
+        except OSError as e:
+            if not quiet:
+                QMessageBox.warning(self, APP_NAME,
+                                    f"Journal non enregistré :\n{e}")
+            return None
+        if not quiet:
+            lines = [f"Journal AstroPlan mis à jour : {len(entries)} "
+                     f"séance(s).", ""]
+            for e in entries[:8]:
+                lines.append(f"  {e['object']} · nuit du {e['night']} · "
+                             f"{e['kept']}/{e['n']} gardées · "
+                             f"{hm(e['exp_kept'])}")
+            lines += ["", f"Fichier : {path}",
+                      "Importez-le dans AstroPlan (onglet Journal), ou copiez-le "
+                      "à côté de la page sur votre serveur :",
+                      f"scp {path} serveur:/var/www/astroplan/site/journal.json"]
+            QMessageBox.information(self, APP_NAME, "\n".join(lines))
+        return path
 
     def show_session_report(self):
         if not self.list.count():
