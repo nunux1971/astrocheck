@@ -4165,6 +4165,16 @@ class PublishDialog(QDialog):
         img_row.addWidget(self.image, 1)
         img_row.addWidget(pick)
         form.addRow("Image finale", img_row)
+        sol_row = QHBoxLayout()
+        self.solve_image = QLineEdit()
+        self.solve_image.setPlaceholderText("facultatif : la même image, même cadrage, avant la réduction d'étoiles")
+        self.solve_image.setToolTip("La réduction d'étoiles empêche souvent ASTAP de reconnaître le champ. "
+                                    "Cette image sert seulement à la résolution ; c'est l'image finale qui est publiée.")
+        pick2 = QPushButton("Choisir…")
+        pick2.clicked.connect(lambda: self.pick_image(self.solve_image))
+        sol_row.addWidget(self.solve_image, 1)
+        sol_row.addWidget(pick2)
+        form.addRow("Pour la résolution", sol_row)
         self.target = QLineEdit(target or "")
         self.target.editingFinished.connect(self.lookup_target)
         form.addRow("Cible", self.target)
@@ -4306,12 +4316,13 @@ class PublishDialog(QDialog):
         return [x for i, x in enumerate(self.sessions)
                 if self.table.item(i, 0) and self.table.item(i, 0).checkState() == Qt.CheckState.Checked]
 
-    def pick_image(self):
-        start = os.path.dirname(self.image.text()) or os.path.expanduser("~")
-        f, _ = QFileDialog.getOpenFileName(self, "Image finale", start,
+    def pick_image(self, edit=None):
+        edit = edit or self.image
+        start = os.path.dirname(edit.text() or self.image.text()) or os.path.expanduser("~")
+        f, _ = QFileDialog.getOpenFileName(self, "Image", start,
                                            "Images (*.jpg *.jpeg *.png *.tif *.tiff *.webp)")
         if f:
-            self.image.setText(f)
+            edit.setText(f)
 
     def check_and_accept(self):
         base, tok = self.site()
@@ -7116,11 +7127,12 @@ class MainWindow(QMainWindow):
             return
         base, tok = dlg.site()
         msg = self.publish(base, tok, dlg.image.text().strip(), dlg.payload(),
-                           dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None)
+                           dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None,
+                           dlg.solve_image.text().strip() or None)
         if msg:
             self.show_publish_result(*msg)
 
-    def publish(self, base, token, src, data, solve, catalogue, fov=None):
+    def publish(self, base, token, src, data, solve, catalogue, fov=None, solve_src=None):
         """Prépare l'image, la résout, l'envoie. Renvoie (ok, texte, réponse)."""
         folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                               APP_ID, "publier")
@@ -7147,8 +7159,16 @@ class MainWindow(QMainWindow):
         note = ""
         if solve:
             small = img
-            if max(img.width(), img.height()) > 2400:     # plus rapide, et assez précis pour le site
-                small = img.scaled(2400, 2400, Qt.AspectRatioMode.KeepAspectRatio,
+            if solve_src:                                 # version sans réduction d'étoiles, même cadrage
+                other = QImage(solve_src)
+                if other.isNull():
+                    return False, "L'image pour la résolution est illisible.", None
+                if abs(other.width() / other.height() - img.width() / img.height()) > 0.01:
+                    return False, (f"L'image pour la résolution ({other.width()} × {other.height()}) n'a pas "
+                                   f"le même cadrage que l'image finale : la grille serait décalée."), None
+                small = other
+            if max(small.width(), small.height()) > 2400:     # plus rapide, et assez précis pour le site
+                small = small.scaled(2400, 2400, Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
             gray = qimage_gray(small)
             path = os.path.join(folder, "solve.fit")
@@ -7188,7 +7208,8 @@ class MainWindow(QMainWindow):
                         + (", image en miroir" if np.linalg.det(np.asarray(wcs["cd"], float)) < 0 else "") + ".")
             else:
                 hint = ("Essais : " + ", ".join(tried) + ". Si l'instrument coché n'est pas celui de "
-                        "la photo, corrigez-le ou indiquez le « Champ vertical »." if fov else
+                        "la photo, corrigez-le ou indiquez le « Champ vertical ». Après une réduction "
+                        "d'étoiles, donnez la version d'avant dans « Pour la résolution »." if fov else
                         "Aucun instrument connu n'est coché : ASTAP ne connaît pas la taille du champ. "
                         "Cochez l'instrument de la photo, ou indiquez le « Champ vertical », et recommencez.")
                 ask = QMessageBox.question(
