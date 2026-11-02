@@ -4180,6 +4180,15 @@ class PublishDialog(QDialog):
             self.rig_boxes[code] = cb
             inst.addWidget(cb)
         form.addRow("Instruments", inst)
+        self.fov = QDoubleSpinBox()
+        self.fov.setRange(0, 60)
+        self.fov.setDecimals(2)
+        self.fov.setSingleStep(0.05)
+        self.fov.setSuffix(" °")
+        self.fov.setSpecialValueText("d'après l'instrument coché")
+        self.fov.setToolTip("Hauteur du champ de l'image finale, pour ASTAP. À saisir pour un instrument "
+                            "absent de la liste (par exemple : 57,3 × hauteur du capteur en mm / focale en mm).")
+        form.addRow("Champ vertical", self.fov)
         lay.addLayout(form)
 
         lay.addWidget(QLabel("Nuits de pose (journal d'AstroCheck) :"))
@@ -7090,11 +7099,11 @@ class MainWindow(QMainWindow):
             return
         base, tok = dlg.site()
         msg = self.publish(base, tok, dlg.image.text().strip(), dlg.payload(),
-                           dlg.solve.isChecked(), dlg.catalogue)
+                           dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None)
         if msg:
             self.show_publish_result(*msg)
 
-    def publish(self, base, token, src, data, solve, catalogue):
+    def publish(self, base, token, src, data, solve, catalogue, fov=None):
         """Prépare l'image, la résout, l'envoie. Renvoie (ok, texte, réponse)."""
         folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                               APP_ID, "publier")
@@ -7139,7 +7148,7 @@ class MainWindow(QMainWindow):
             wcs, out = None, ""
             # d'abord avec le champ attendu de l'instrument (ASTAP en a besoin à ±10 %),
             # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
-            fov = rig_fov(data.get("instruments") or [], gray.shape)
+            fov = fov or rig_fov(data.get("instruments") or [], gray.shape)
             tried, first_out = [], ""
             for f in ([fov, fov * 0.85, None] if fov else [None]):
                 if not solver:
@@ -7158,9 +7167,10 @@ class MainWindow(QMainWindow):
                         # FITS écrit ligne du haut en premier : à l'écran, det < 0 = miroir
                         + (", image en miroir" if np.linalg.det(np.asarray(wcs["cd"], float)) < 0 else "") + ".")
             else:
-                hint = ("Essais : " + ", ".join(tried) + "." if fov else
+                hint = ("Essais : " + ", ".join(tried) + ". Si l'instrument coché n'est pas celui de "
+                        "la photo, corrigez-le ou indiquez le « Champ vertical »." if fov else
                         "Aucun instrument connu n'est coché : ASTAP ne connaît pas la taille du champ. "
-                        "Cochez l'instrument de la photo et recommencez.")
+                        "Cochez l'instrument de la photo, ou indiquez le « Champ vertical », et recommencez.")
                 ask = QMessageBox.question(
                     self, APP_NAME, (self._solver_failure(solver, first_out) if solver else "Aucun solveur.")
                     + "\n\n" + hint + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
