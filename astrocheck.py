@@ -38,6 +38,11 @@ import subprocess
 import shlex
 import time
 import functools
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
@@ -1488,6 +1493,139 @@ def merge_journal(path, entries):
                   indent=1)
     os.replace(tmp, path)
     return len(entries)
+
+
+# ----------------------------------------------------------------------------
+# Publication sur le site (ericastro.fr) : API à jeton, voir le README du site
+# ----------------------------------------------------------------------------
+
+SITE_DEFAUT = "https://ericastro.fr"
+SITE_COTE_MAX = 4096          # côté le plus long de l'image envoyée
+
+
+def norm_name(s):
+    """Clé de comparaison des noms de cible (comme AstroPlan) : « Messier 031 » = « M31 »."""
+    s = unicodedata.normalize("NFD", str(s or "").upper())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"^MESSIER", "M", s)
+    s = re.sub(r"^SH\s*2\s*[- ]?\s*", "SH2-", s)
+    s = re.sub(r"[\s_]+", "", s)
+    return re.sub(r"^(NGC|IC|M|C|SH2-)0+(\d)", r"\1\2", s)
+
+
+def rig_of(e):
+    """Code AstroPlan de l'instrument d'une série, d'après la caméra et la focale."""
+    cam = str(e.get("camera") or "").upper()
+    try:
+        f = float(e.get("focal") or 0)
+    except (TypeError, ValueError):
+        f = 0
+    if cam == "TELE" or "TELE" in cam.split():
+        return "dtele"
+    if cam == "WIDE" or "WIDE" in cam.split():
+        return "dwide"
+    canon = bool(re.search(r"CANON|EOS|1100D", cam))
+    if f > 650:
+        return "n200"
+    if f > 440:
+        return "o85c" if canon else "o85"
+    if f > 300:
+        return "a60c" if canon else "a60z"
+    return None
+
+
+def seances_for(entries, names):
+    """Séances du journal pour une cible (plusieurs noms possibles), en séances du site."""
+    keys = {norm_name(n) for n in names if n}
+    out = []
+    for e in entries:
+        if not isinstance(e, dict) or norm_name(e.get("object")) not in keys or not e.get("night"):
+            continue
+        out.append({"nuit": e["night"], "instrument": rig_of(e), "camera": e.get("camera") or "",
+                    "filtre": e.get("filter") or "", "pose_s": e.get("exptime"), "gain": e.get("gain"),
+                    "n_gardees": e.get("kept"), "n_total": e.get("n"), "fwhm": e.get("fwhm")})
+    # une même série peut venir du journal et de la liste en cours : on garde la dernière
+    uniq = OrderedDict()
+    for x in out:
+        uniq[(x["nuit"], x["camera"], x["filtre"], x["pose_s"], x["gain"])] = x
+    return sorted(uniq.values(), key=lambda x: x["nuit"])
+
+
+def read_journal(path=None):
+    try:
+        with open(path or journal_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return data.get("entries", []) if isinstance(data, dict) else (data or [])
+
+
+def multipart_body(fields, files):
+    """Corps multipart/form-data. files : {nom: (nom de fichier, octets, type)}."""
+    limite = "----astrocheck" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        parts.append(f'--{limite}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+                     + str(v).encode("utf-8") + b"\r\n")
+    for k, (nom, data, ctype) in files.items():
+        parts.append(f'--{limite}\r\nContent-Disposition: form-data; name="{k}"; filename="{nom}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n".encode() + data + b"\r\n")
+    parts.append(f"--{limite}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={limite}"
+
+
+def site_request(base, token, path, fields=None, files=None, timeout=30):
+    """Appel de l'API du site. Renvoie (code HTTP, réponse JSON) ; code 0 si injoignable."""
+    url = base.rstrip("/") + path
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": f"{APP_NAME}"}
+    data = None
+    if fields is not None or files:
+        data, ctype = multipart_body(fields or {}, files or {})
+        headers["Content-Type"] = ctype
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8") or "{}")
+        except ValueError:
+            body = {}
+        return e.code, body if isinstance(body, dict) else {}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {"erreur": str(getattr(e, "reason", e))}
+
+
+def site_error(code, body):
+    """Message clair pour une réponse d'erreur de l'API."""
+    if code == 0:
+        return f"Site injoignable : {body.get('erreur', '')}"
+    if code == 401:
+        return "Jeton refusé : recopiez-le depuis /etc/ericastro/env sur le serveur."
+    if code == 404 and not body:
+        return "Le site ne connaît pas cette adresse : est-il à jour (mettre_a_jour.sh) ?"
+    if code == 413:
+        return "Image trop lourde pour le serveur."
+    return body.get("erreur") or f"Réponse inattendue du site (code {code})."
+
+
+def wcs_payload(w, shape):
+    """Solution à envoyer au site. Le FITS a été écrit ligne du haut en premier :
+    le y des pixels FITS descend comme à l'écran (y_inverse faux)."""
+    cd = np.asarray(w["cd"], dtype=float)
+    return {"crval": [float(w["crval"][0]), float(w["crval"][1])],
+            "crpix": [float(w["crpix"][0]), float(w["crpix"][1])],
+            "cd": [[float(cd[0, 0]), float(cd[0, 1])], [float(cd[1, 0]), float(cd[1, 1])]],
+            "largeur": int(shape[1]), "hauteur": int(shape[0]), "y_inverse": False}
+
+
+def qimage_gray(img):
+    """QImage → tableau numpy 2D (niveaux de gris, ligne du haut en premier)."""
+    g = img.convertToFormat(QImage.Format.Format_Grayscale8)
+    w, h, bpl = g.width(), g.height(), g.bytesPerLine()
+    ptr = g.constBits()
+    ptr.setsize(h * bpl)
+    return np.frombuffer(ptr, np.uint8).reshape(h, bpl)[:, :w].astype(np.float32)
 
 
 def night_of(date):
@@ -3954,6 +4092,218 @@ class PreselectDialog(QDialog):
 # Fenêtre principale
 # ----------------------------------------------------------------------------
 
+class PublishDialog(QDialog):
+    """Publier une image finale sur le site : image, textes, fiche technique,
+    nuits de pose tirées du journal, et résolution astrométrique de l'image."""
+
+    def __init__(self, parent, target, entries, solver_ok):
+        super().__init__(parent)
+        self.setWindowTitle("Publier sur le site")
+        self.entries = entries
+        self.catalogue = None
+        self.existing = []
+        st = settings()
+        lay = QVBoxLayout(self)
+
+        site = QGroupBox("Site")
+        sf = QFormLayout(site)
+        self.url = QLineEdit(st.value("site/url", SITE_DEFAUT) or SITE_DEFAUT)
+        self.token = QLineEdit(st.value("site/jeton", "") or "")
+        self.token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token.setPlaceholderText("le jeton ERICASTRO_JETON_API du serveur")
+        row = QHBoxLayout()
+        row.addWidget(self.token, 1)
+        test = QPushButton("Tester")
+        test.clicked.connect(self.test_site)
+        row.addWidget(test)
+        sf.addRow("Adresse", self.url)
+        sf.addRow("Jeton", row)
+        self.site_state = QLabel("")
+        self.site_state.setWordWrap(True)
+        sf.addRow("", self.site_state)
+        lay.addWidget(site)
+
+        form = QFormLayout()
+        img_row = QHBoxLayout()
+        self.image = QLineEdit(st.value("site/derniere_image", "") or "")
+        self.image.setPlaceholderText("l'image finale traitée (JPEG, PNG, TIFF)")
+        pick = QPushButton("Choisir…")
+        pick.clicked.connect(self.pick_image)
+        img_row.addWidget(self.image, 1)
+        img_row.addWidget(pick)
+        form.addRow("Image finale", img_row)
+        self.target = QLineEdit(target or "")
+        self.target.editingFinished.connect(self.lookup_target)
+        form.addRow("Cible", self.target)
+        self.replace = QComboBox()
+        self.replace.addItem("Nouvelle photo", "")
+        form.addRow("Sur le site", self.replace)
+        self.title_fr = QLineEdit()
+        self.title_fr.setPlaceholderText("vide : le nom de la cible")
+        self.title_en = QLineEdit()
+        form.addRow("Titre", self.title_fr)
+        form.addRow("Titre (anglais)", self.title_en)
+        self.text_fr = QPlainTextEdit()
+        self.text_fr.setPlaceholderText("Les conditions de la nuit, ce que montre l'image…")
+        self.text_fr.setFixedHeight(80)
+        self.text_en = QPlainTextEdit()
+        self.text_en.setFixedHeight(60)
+        form.addRow("Texte", self.text_fr)
+        form.addRow("Texte (anglais)", self.text_en)
+        self.filters = QLineEdit()
+        form.addRow("Filtres", self.filters)
+        self.processing = QLineEdit(st.value("site/traitement", "") or "")
+        self.processing.setPlaceholderText("Siril, PixInsight, GraXpert…")
+        form.addRow("Traitement", self.processing)
+        inst = QHBoxLayout()
+        self.rig_boxes = {}
+        for code, label in (("n200", "TS 200/800"), ("o85", "Omegon 85"), ("a60z", "Askar 60F + ASI294"),
+                            ("a60c", "Askar 60F + Canon"), ("o85c", "Omegon 85 + Canon"),
+                            ("dtele", "Dwarf TELE"), ("dwide", "Dwarf WIDE")):
+            cb = QCheckBox(label)
+            self.rig_boxes[code] = cb
+            inst.addWidget(cb)
+        form.addRow("Instruments", inst)
+        lay.addLayout(form)
+
+        lay.addWidget(QLabel("Nuits de pose (journal d'AstroCheck) :"))
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Nuit", "Instrument", "Filtre", "Poses gardées", "Total", "FWHM"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setMinimumHeight(140)
+        lay.addWidget(self.table)
+
+        self.solve = QCheckBox("Résoudre l'image finale (grille RA/DEC et noms d'objets sur le site)")
+        self.solve.setChecked(solver_ok)
+        self.solve.setEnabled(solver_ok)
+        if not solver_ok:
+            self.solve.setToolTip("ASTAP ou Siril introuvable")
+        lay.addWidget(self.solve)
+        self.publish_now = QCheckBox("Mettre en ligne tout de suite (sinon brouillon à relire dans l'administration)")
+        lay.addWidget(self.publish_now)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Envoyer")
+        bb.accepted.connect(self.check_and_accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.resize(900, 760)
+        self.fill_sessions()
+        if self.token.text().strip():
+            QTimer.singleShot(0, self.lookup_target)
+
+    # -- site
+    def site(self):
+        return self.url.text().strip() or SITE_DEFAUT, self.token.text().strip()
+
+    def test_site(self):
+        base, tok = self.site()
+        self.site_state.setText("Connexion…")
+        QApplication.processEvents()
+        code, body = site_request(base, tok, "/api/instruments/", timeout=10)
+        if code == 200:
+            self.site_state.setText(f"Connecté : {len(body.get('instruments', []))} instruments sur le site.")
+            settings().setValue("site/url", base)
+            settings().setValue("site/jeton", tok)
+            self.lookup_target()
+        else:
+            self.site_state.setText(site_error(code, body))
+
+    def lookup_target(self):
+        """Interroge le site : nom officiel, alias et photos déjà publiées de la cible."""
+        base, tok = self.site()
+        name = self.target.text().strip()
+        if not tok or not name:
+            return
+        code, body = site_request(base, tok, "/api/cible/?" + urllib.parse.urlencode({"q": name}), timeout=10)
+        if code != 200:
+            self.site_state.setText(site_error(code, body))
+            return
+        self.catalogue = body.get("catalogue")
+        self.existing = body.get("photos") or []
+        self.replace.clear()
+        self.replace.addItem("Nouvelle photo", "")
+        for p in self.existing:
+            self.replace.addItem(f"Remplacer « {p['titre']} »" + ("" if p.get("publiee") else " (brouillon)"), p["slug"])
+        c = self.catalogue
+        self.site_state.setText(
+            (f"{name} : {c['designation']}" + (f" · {c['nom_fr']}" if c.get("nom_fr") else "")
+             + (f" · {len(self.existing)} photo(s) déjà sur le site" if self.existing else ""))
+            if c else f"« {name} » n'est pas dans le catalogue : la cible sera créée sans coordonnées.")
+        self.fill_sessions()
+
+    def names(self):
+        n = [self.target.text().strip()]
+        c = self.catalogue
+        if c:
+            n += [c.get("designation"), *(c.get("alias") or []), c.get("nom_fr"), c.get("nom_en")]
+        return n
+
+    def fill_sessions(self):
+        self.sessions = seances_for(self.entries, self.names())
+        self.table.setRowCount(len(self.sessions))
+        for i, x in enumerate(self.sessions):
+            total = (x["pose_s"] or 0) * (x["n_gardees"] or 0)
+            cells = [x["nuit"], x["instrument"] or x["camera"] or "?", x["filtre"] or "—",
+                     f"{x['n_gardees'] or '?'}/{x['n_total'] or '?'} × {fr(x['pose_s'] or 0, 0)} s",
+                     hm(total), f"{fr(x['fwhm'], 1)} px" if x.get("fwhm") else "—"]
+            for j, t in enumerate(cells):
+                it = QTableWidgetItem(str(t))
+                if j == 0:
+                    it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    it.setCheckState(Qt.CheckState.Checked)
+                self.table.setItem(i, j, it)
+        rigs = {x["instrument"] for x in self.sessions if x["instrument"]}
+        for code, cb in self.rig_boxes.items():
+            cb.setChecked(code in rigs)
+        if not self.filters.text().strip():
+            self.filters.setText(" + ".join(OrderedDict.fromkeys(x["filtre"] for x in self.sessions if x["filtre"])))
+
+    def chosen_sessions(self):
+        return [x for i, x in enumerate(self.sessions)
+                if self.table.item(i, 0) and self.table.item(i, 0).checkState() == Qt.CheckState.Checked]
+
+    def pick_image(self):
+        start = os.path.dirname(self.image.text()) or os.path.expanduser("~")
+        f, _ = QFileDialog.getOpenFileName(self, "Image finale", start,
+                                           "Images (*.jpg *.jpeg *.png *.tif *.tiff *.webp)")
+        if f:
+            self.image.setText(f)
+
+    def check_and_accept(self):
+        base, tok = self.site()
+        if not tok:
+            QMessageBox.warning(self, APP_NAME, "Indiquez le jeton du site (voir le README d'ericastro.fr).")
+            return
+        if not os.path.isfile(self.image.text().strip()):
+            QMessageBox.warning(self, APP_NAME, "Choisissez l'image finale à publier.")
+            return
+        if not self.target.text().strip() and not self.replace.currentData():
+            QMessageBox.warning(self, APP_NAME, "Indiquez la cible (par exemple IC 1805).")
+            return
+        st = settings()
+        st.setValue("site/url", base)
+        st.setValue("site/jeton", tok)
+        st.setValue("site/derniere_image", self.image.text().strip())
+        st.setValue("site/traitement", self.processing.text().strip())
+        self.accept()
+
+    def payload(self):
+        d = {"designation": self.target.text().strip(),
+             "titre_fr": self.title_fr.text().strip(), "titre_en": self.title_en.text().strip(),
+             "texte_fr": self.text_fr.toPlainText().strip(), "texte_en": self.text_en.toPlainText().strip(),
+             "filtres": self.filters.text().strip(), "traitement": self.processing.text().strip(),
+             "instruments": [c for c, cb in self.rig_boxes.items() if cb.isChecked()],
+             "seances": self.chosen_sessions(), "publier": self.publish_now.isChecked()}
+        if self.replace.currentData():
+            d["remplacer"] = self.replace.currentData()
+            for k in ("titre_fr", "titre_en", "texte_fr", "texte_en"):   # vide : on garde le texte du site
+                if not d[k]:
+                    del d[k]
+        return d
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4185,6 +4535,8 @@ class MainWindow(QMainWindow):
                      self.update_journal, "Ctrl+J")
         self._action(m, "Envoi automatique du journal au serveur…",
                      self.upload_dialog)
+        self._action(m, "Publier une image sur le site…", self.publish_dialog,
+                     "Ctrl+Shift+P")
         self._action(m, "Rotation de champ et zone utile…",
                      self.show_geometry_report, "Ctrl+U")
         self._action(m, "Lieu d'observation…", self.site_dialog)
@@ -6711,6 +7063,115 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_NAME, "\n".join(lines))
         return path
 
+    # -- publication sur le site
+    def publish_dialog(self):
+        rows = self.journal_rows()
+        current = journal_entries(rows)
+        targets = [r["object"] for r in rows if r.get("object")]
+        target = max(set(targets), key=targets.count) if targets else ""
+        dlg = PublishDialog(self, target, read_journal() + current, bool(self.find_solver()))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        base, tok = dlg.site()
+        msg = self.publish(base, tok, dlg.image.text().strip(), dlg.payload(),
+                           dlg.solve.isChecked(), dlg.catalogue)
+        if msg:
+            self.show_publish_result(*msg)
+
+    def publish(self, base, token, src, data, solve, catalogue):
+        """Prépare l'image, la résout, l'envoie. Renvoie (ok, texte, réponse)."""
+        folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                              APP_ID, "publier")
+        os.makedirs(folder, exist_ok=True)
+        img = QImage(src)
+        if img.isNull():
+            return False, ("Image illisible. Pour un TIFF 16 bits, exportez d'abord un JPEG "
+                           "depuis votre logiciel de traitement."), None
+        big = max(img.width(), img.height())
+        if src.lower().endswith((".jpg", ".jpeg")) and big <= SITE_COTE_MAX:
+            with open(src, "rb") as f:                   # JPEG déjà prêt : envoyé tel quel
+                jpeg = f.read()
+        else:
+            if big > SITE_COTE_MAX:
+                img = img.scaled(SITE_COTE_MAX, SITE_COTE_MAX, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+            out = os.path.join(folder, "image.jpg")
+            if not img.convertToFormat(QImage.Format.Format_RGB888).save(out, "JPG", 92):
+                return False, "Conversion en JPEG impossible.", None
+            with open(out, "rb") as f:
+                jpeg = f.read()
+            img = QImage(out)
+        note = ""
+        if solve:
+            small = img
+            if max(img.width(), img.height()) > 2400:     # plus rapide, et assez précis pour le site
+                small = img.scaled(2400, 2400, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            gray = qimage_gray(small)
+            path = os.path.join(folder, "solve.fit")
+            for old in os.listdir(folder):
+                if old.startswith("solve"):
+                    try:
+                        os.remove(os.path.join(folder, old))
+                    except OSError:
+                        pass
+            fits.PrimaryHDU(data=np.ascontiguousarray(gray)).writeto(path, overwrite=True)
+            hints = {"ra": None, "dec": None, "scale": None, "fov_h": None}
+            if catalogue and catalogue.get("ra") is not None:
+                hints["ra"], hints["dec"] = catalogue["ra"], catalogue["dec"]
+            solver = self.find_solver()
+            wcs, out = self._run_solver(solver, path, hints, folder) if solver else (None, "")
+            if wcs:
+                data["wcs"] = wcs_payload(wcs, gray.shape)
+                sm = wcs_summary(wcs, gray.shape)
+                note = (f"Résolue : centre RA {ra_text(sm['ra'])}, DEC {dec_text(sm['dec'])}, "
+                        f"champ {fr(sm['fov'][0], 2)}° × {fr(sm['fov'][1], 2)}°"
+                        # FITS écrit ligne du haut en premier : à l'écran, det < 0 = miroir
+                        + (", image en miroir" if np.linalg.det(np.asarray(wcs["cd"], float)) < 0 else "") + ".")
+            else:
+                ask = QMessageBox.question(
+                    self, APP_NAME, (self._solver_failure(solver, out) if solver else "Aucun solveur.")
+                    + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
+                if ask != QMessageBox.StandardButton.Yes:
+                    return None
+                note = "Image non résolue : pas de grille ni de noms d'objets sur le site."
+        # envoi dans un fil à part, la fenêtre reste vivante
+        result = {}
+
+        def work():
+            result["r"] = site_request(base, token, "/api/photos/", fields={"donnees": json.dumps(data, ensure_ascii=False)},
+                                       files={"image": ("image.jpg", jpeg, "image/jpeg")}, timeout=600)
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        prog = QProgressDialog(f"Envoi de l'image ({len(jpeg) / 1e6:.1f} Mo)…", "", 0, 0, self)
+        prog.setCancelButton(None)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        while th.is_alive():
+            QApplication.processEvents()
+            time.sleep(0.05)
+        prog.close()
+        code, body = result.get("r", (0, {"erreur": "pas de réponse"}))
+        if code in (200, 201):
+            etat = "en ligne" if body.get("publiee") else "enregistrée en brouillon : relisez-la puis cochez « publiée » dans l'administration"
+            return True, f"Photo {etat}.\n{note}", body
+        return False, site_error(code, body) + (f"\n{note}" if note else ""), body
+
+    def show_publish_result(self, ok, text, body):
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Information if ok else QMessageBox.Icon.Warning)
+        box.setText(text)
+        links = []
+        if ok and body:
+            links = [("Voir la page", body.get("url")), ("Ouvrir dans l'administration", body.get("gestion"))]
+            for label, url in links:
+                if url:
+                    b = box.addButton(label, QMessageBox.ButtonRole.ActionRole)
+                    b.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+
     # -- envoi du journal au serveur d'AstroPlan
     def start_journal_upload(self, path, template=None):
         """Lance la commande d'envoi en arrière-plan ; renvoie True si lancée."""
@@ -6897,7 +7358,7 @@ class MainWindow(QMainWindow):
 
     def run_plate_solve(self, res, parent=None):
         """Résout l'aperçu avec ASTAP (ou Siril). Renvoie (solution, message)."""
-        solver = ("astap", find_astap()) if find_astap() else (("siril", find_siril()) if find_siril() else None)
+        solver = self.find_solver()
         if not solver:
             return None, ("Aucun solveur trouvé. Installez ASTAP (gratuit, hors ligne) : "
                           "le paquet astap_amd64.deb et la base d'étoiles D50 sur "
@@ -6921,7 +7382,37 @@ class MainWindow(QMainWindow):
                 hdr[k] = res["header"][k]
         fits.PrimaryHDU(data=np.ascontiguousarray(mono, dtype=np.float32), header=hdr).writeto(path, overwrite=True)
         hints = solve_hints(res["header"], res["scale"], mono.shape)
+        wcs, out = self._run_solver(solver, path, hints, folder, parent)
+        name = "ASTAP" if solver[0] == "astap" else "Siril"
+        if not wcs:
+            return None, self._solver_failure(solver, out)
+        s = wcs_summary(wcs, res["stack"].shape[:2], res["scale"])
+        return wcs, (f"Centre : RA {ra_text(s['ra'])}, DEC {dec_text(s['dec'])} · "
+                     f"échelle {fr(s['scale_file'], 2)}″/px dans les brutes · champ "
+                     f"{fr(s['fov'][0], 2)}° × {fr(s['fov'][1], 2)}° · angle de position "
+                     f"{fr(s['angle'], 1)}° (convention ASTAP)"
+                     + (" · image en miroir" if s["mirrored"] else "")
+                     + f". Résolu par {name} ; la solution est ajoutée au FITS enregistré.")
+
+    @staticmethod
+    def find_solver():
+        if find_astap():
+            return ("astap", find_astap())
+        return ("siril", find_siril()) if find_siril() else None
+
+    @staticmethod
+    def _solver_failure(solver, out):
+        last = [l for l in (out or "").strip().splitlines() if l.strip()][-3:]
+        return ("Pas de solution. " + (
+            "Vérifiez que la base d'étoiles d'ASTAP couvre ce champ (D50 au-delà de 0,5°). "
+            if solver[0] == "astap" else "Siril a-t-il accès à internet (catalogue en ligne) ? ")
+            + ("Fin du journal : " + " / ".join(last) if last else ""))
+
+    def _run_solver(self, solver, path, hints, folder, parent=None):
+        """Lance ASTAP ou Siril sur un FITS ; renvoie (solution ou None, sortie du solveur)."""
         cmd, solved = solver_command(solver, path, hints)
+        if solver[0] == "astap" and not hints.get("fov_h"):
+            cmd += ["-fov", "0"]                     # champ inconnu : ASTAP le cherche
         name = "ASTAP" if solver[0] == "astap" else "Siril"
         prog = QProgressDialog(f"Résolution astrométrique avec {name}…", "Annuler", 0, 0, parent or self)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -6942,20 +7433,7 @@ class MainWindow(QMainWindow):
             time.sleep(0.1)
         prog.close()
         out = proc.stdout.read() if proc.stdout else ""
-        wcs = read_solution(solver[0], path, solved)
-        if not wcs:
-            last = [l for l in out.strip().splitlines() if l.strip()][-3:]
-            return None, ("Pas de solution. " + (
-                "Vérifiez que la base d'étoiles d'ASTAP couvre ce champ (D50 au-delà de 0,5°). "
-                if solver[0] == "astap" else "Siril a-t-il accès à internet (catalogue en ligne) ? ")
-                + ("Fin du journal : " + " / ".join(last) if last else ""))
-        s = wcs_summary(wcs, res["stack"].shape[:2], res["scale"])
-        return wcs, (f"Centre : RA {ra_text(s['ra'])}, DEC {dec_text(s['dec'])} · "
-                     f"échelle {fr(s['scale_file'], 2)}″/px dans les brutes · champ "
-                     f"{fr(s['fov'][0], 2)}° × {fr(s['fov'][1], 2)}° · angle de position "
-                     f"{fr(s['angle'], 1)}° (convention ASTAP)"
-                     + (" · image en miroir" if s["mirrored"] else "")
-                     + f". Résolu par {name} ; la solution est ajoutée au FITS enregistré.")
+        return read_solution(solver[0], path, solved), out
 
     def light_order_pairs(self, pairs):
         order = self.light_order([s for s, _t in pairs])

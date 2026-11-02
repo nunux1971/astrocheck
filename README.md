@@ -61,6 +61,17 @@ python3 astrocheck.py ~/Astro/NGC7380
 
 La notice complète est dans [NOTICE.md](NOTICE.md).
 
+## Publier une image sur ericastro.fr
+
+**Analyse ▸ Publier une image sur le site…** (Ctrl+Maj+P) envoie l'image finale traitée
+(JPEG, PNG ou TIFF 8 bits) avec ses textes, ses filtres, ses instruments et les nuits de pose
+tirées du journal. L'image est d'abord résolue par ASTAP : le site affiche alors la grille
+RA/DEC et les noms des objets du champ, exactement placés. Sans case « Mettre en ligne tout
+de suite », la photo arrive en brouillon à relire dans l'administration du site.
+
+Le jeton demandé est la valeur `ERICASTRO_JETON_API` du fichier `/etc/ericastro/env` sur le
+serveur ; AstroCheck le garde dans `~/.config/astrocheck/astrocheck.conf`.
+
 ## Licence
 
 AstroCheck est un logiciel libre, distribué sous licence [GPL-2.0](LICENSE).
