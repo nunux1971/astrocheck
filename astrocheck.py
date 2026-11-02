@@ -1534,9 +1534,26 @@ def rig_of(e):
     return None
 
 
-# focale (mm) et capteur (petit côté, grand côté, en mm) des instruments d'AstroPlan
-RIG_OPTICS = {"n200": (800, 13.07, 19.19), "o85": (469, 13.07, 19.19), "a60z": (408, 13.07, 19.19),
-              "a60c": (408, 14.81, 22.21), "o85c": (469, 14.81, 22.21), "dtele": (150, 4.32, 7.68)}
+# focale (mm), capteur (petit côté, grand côté, en mm) et pixel (µm) des instruments d'AstroPlan
+RIG_OPTICS = {"n200": (800, 13.07, 19.19, 4.63), "o85": (469, 13.07, 19.19, 4.63), "a60z": (408, 13.07, 19.19, 4.63),
+              "a60c": (408, 14.81, 22.21, 5.2), "o85c": (469, 14.81, 22.21, 5.2), "dtele": (150, 4.32, 7.68, 2.0)}
+
+
+def fov_candidates(codes, height, shape):
+    """Hauteurs de champ (°) à essayer pour une image finale de « height » pixels :
+    image recadrée à l'échelle d'origine (le cas le plus courant), image entière,
+    puis image agrandie ×2 (drizzle)."""
+    out = []
+    for c in codes:
+        if c in RIG_OPTICS:
+            focal, short, long_, pix = RIG_OPTICS[c]
+            native = np.degrees(pix / 1000.0 / focal) * height          # même échelle que les brutes
+            full = rig_fov([c], shape)
+            for f in (native, full, native / 2):
+                if f and all(abs(f - g) / g > 0.08 for g in out):
+                    out.append(float(f))
+            break
+    return out
 
 
 def rig_fov(codes, shape):
@@ -1544,7 +1561,7 @@ def rig_fov(codes, shape):
     None si aucun (le Dwarf WIDE est trop grand champ pour la base D50)."""
     for c in codes:
         if c in RIG_OPTICS:
-            focal, short, long_ = RIG_OPTICS[c]
+            focal, short, long_, _pix = RIG_OPTICS[c]
             side = long_ if shape[0] > shape[1] else short        # image en portrait : grand côté
             return np.degrees(side / focal)
     return None
@@ -7112,6 +7129,7 @@ class MainWindow(QMainWindow):
         if img.isNull():
             return False, ("Image illisible. Pour un TIFF 16 bits, exportez d'abord un JPEG "
                            "depuis votre logiciel de traitement."), None
+        src_height = img.height()                         # avant toute réduction pour l'envoi
         big = max(img.width(), img.height())
         if src.lower().endswith((".jpg", ".jpeg")) and big <= SITE_COTE_MAX:
             with open(src, "rb") as f:                   # JPEG déjà prêt : envoyé tel quel
@@ -7148,10 +7166,11 @@ class MainWindow(QMainWindow):
             wcs, out = None, ""
             # d'abord avec le champ attendu de l'instrument (ASTAP en a besoin à ±10 %),
             # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
-            fov = fov or rig_fov(data.get("instruments") or [], gray.shape)
+            # champ saisi, sinon calculé : image recadrée à l'échelle des brutes, entière, ou drizzle ×2
+            candidates = [fov] if fov else fov_candidates(data.get("instruments") or [], src_height, gray.shape)
+            fov = candidates[0] if candidates else None
             tried, first_out = [], ""
-            # image recadrée : champ plus petit que celui de l'instrument, on descend par paliers
-            for f in ([fov, fov * 0.85, fov * 0.7, fov * 0.55, None] if fov else [None]):
+            for f in candidates + [None]:
                 if not solver:
                     break
                 hints["fov_h"] = f
