@@ -7140,11 +7140,14 @@ class MainWindow(QMainWindow):
             # d'abord avec le champ attendu de l'instrument (ASTAP en a besoin à ±10 %),
             # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
             fov = rig_fov(data.get("instruments") or [], gray.shape)
+            tried, first_out = [], ""
             for f in ([fov, fov * 0.85, None] if fov else [None]):
                 if not solver:
                     break
                 hints["fov_h"] = f
                 wcs, out = self._run_solver(solver, path, hints, folder)
+                tried.append(f"champ {fr(f, 2)}°" if f else "recherche libre")
+                first_out = first_out or out
                 if wcs:
                     break
             if wcs:
@@ -7155,9 +7158,12 @@ class MainWindow(QMainWindow):
                         # FITS écrit ligne du haut en premier : à l'écran, det < 0 = miroir
                         + (", image en miroir" if np.linalg.det(np.asarray(wcs["cd"], float)) < 0 else "") + ".")
             else:
+                hint = ("Essais : " + ", ".join(tried) + "." if fov else
+                        "Aucun instrument connu n'est coché : ASTAP ne connaît pas la taille du champ. "
+                        "Cochez l'instrument de la photo et recommencez.")
                 ask = QMessageBox.question(
-                    self, APP_NAME, (self._solver_failure(solver, out) if solver else "Aucun solveur.")
-                    + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
+                    self, APP_NAME, (self._solver_failure(solver, first_out) if solver else "Aucun solveur.")
+                    + "\n\n" + hint + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
                 if ask != QMessageBox.StandardButton.Yes:
                     return None
                 note = "Image non résolue : pas de grille ni de noms d'objets sur le site."
