@@ -7150,7 +7150,8 @@ class MainWindow(QMainWindow):
             # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
             fov = fov or rig_fov(data.get("instruments") or [], gray.shape)
             tried, first_out = [], ""
-            for f in ([fov, fov * 0.85, None] if fov else [None]):
+            # image recadrée : champ plus petit que celui de l'instrument, on descend par paliers
+            for f in ([fov, fov * 0.85, fov * 0.7, fov * 0.55, None] if fov else [None]):
                 if not solver:
                     break
                 hints["fov_h"] = f
