@@ -2427,7 +2427,7 @@ def find_stars(gray, n=150, k_sigma=5.0):
     bg = np.median(blocks, axis=2)
     bgf = np.repeat(np.repeat(bg, b, 0), b, 1)
     bgf = np.pad(bgf, ((0, h - bgf.shape[0]), (0, w - bgf.shape[1])), mode="edge")
-    r = a - bgf
+    r = box3(a - bgf)                     # lissage : pixels chauds et bruit ne font plus d'étoiles
     sub = subsample(r)
     sigma = 1.4826 * float(np.median(np.abs(sub - np.median(sub)))) or 1e-6
     R = 4
@@ -2447,9 +2447,9 @@ def find_stars(gray, n=150, k_sigma=5.0):
     ring /= 8
     peak = r[ys, xs]
     contrast = peak - ring
-    keep = contrast > 0.6 * peak                    # ponctuelle : l'anneau est sombre
+    keep = contrast > 0.5 * peak                    # ponctuelle : l'anneau est sombre
     ys, xs, contrast = ys[keep], xs[keep], contrast[keep]
-    order = np.argsort(-contrast)
+    order = np.argsort(-contrast)                   # les plus brillantes (lissées) d'abord
     out = []
     for i in order:
         y, x = int(ys[i]), int(xs[i])
@@ -2480,6 +2480,30 @@ def register_crop(final_gray, stack_gray):
     st = red(stack_gray)
     fi = red(final_gray)
     ref = find_stars(st, 200)
+    # même taille : image entière, seulement retournée ou tournée de 180° (cas le plus courant)
+    if final_gray.shape == stack_gray.shape:
+        many_ref = find_stars(st, 600)
+        many = find_stars(fi, 600)
+        hb, wb = fi.shape
+        found = None
+        for fx, fy in ((False, False), (False, True), (True, False), (True, True)):
+            q = many.copy()
+            if fx:
+                q[:, 0] = wb - 1 - q[:, 0]
+            if fy:
+                q[:, 1] = hb - 1 - q[:, 1]
+            if not len(q) or not len(many_ref):
+                continue
+            d = np.hypot(*(q[:, None, :] - many_ref[None, :, :]).transpose(2, 0, 1)).min(axis=1)
+            n = int((d < 1.5).sum())
+            if found is None or n > found[0]:
+                found = (n, fx, fy)
+        if found and found[0] >= max(8, 0.2 * min(len(many), len(many_ref))):
+            _n, fx, fy = found
+            H, W = final_gray.shape
+            A = np.array([[-1.0 if fx else 1.0, 0.0], [0.0, -1.0 if fy else 1.0]])
+            T = np.array([W - 1.0 if fx else 0.0, H - 1.0 if fy else 0.0])
+            return A, T, found[0]
     best = None
     for flip in (False, True):
         img = fi[::-1] if flip else fi
