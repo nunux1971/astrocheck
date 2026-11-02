@@ -1534,6 +1534,22 @@ def rig_of(e):
     return None
 
 
+# focale (mm) et capteur (petit côté, grand côté, en mm) des instruments d'AstroPlan
+RIG_OPTICS = {"n200": (800, 13.07, 19.19), "o85": (469, 13.07, 19.19), "a60z": (408, 13.07, 19.19),
+              "a60c": (408, 14.81, 22.21), "o85c": (469, 14.81, 22.21), "dtele": (150, 4.32, 7.68)}
+
+
+def rig_fov(codes, shape):
+    """Hauteur du champ (°) de l'image finale d'après le premier instrument connu ;
+    None si aucun (le Dwarf WIDE est trop grand champ pour la base D50)."""
+    for c in codes:
+        if c in RIG_OPTICS:
+            focal, short, long_ = RIG_OPTICS[c]
+            side = long_ if shape[0] > shape[1] else short        # image en portrait : grand côté
+            return np.degrees(side / focal)
+    return None
+
+
 def seances_for(entries, names):
     """Séances du journal pour une cible (plusieurs noms possibles), en séances du site."""
     keys = {norm_name(n) for n in names if n}
@@ -7120,7 +7136,17 @@ class MainWindow(QMainWindow):
             if catalogue and catalogue.get("ra") is not None:
                 hints["ra"], hints["dec"] = catalogue["ra"], catalogue["dec"]
             solver = self.find_solver()
-            wcs, out = self._run_solver(solver, path, hints, folder) if solver else (None, "")
+            wcs, out = None, ""
+            # d'abord avec le champ attendu de l'instrument (ASTAP en a besoin à ±10 %),
+            # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
+            fov = rig_fov(data.get("instruments") or [], gray.shape)
+            for f in ([fov, fov * 0.85, None] if fov else [None]):
+                if not solver:
+                    break
+                hints["fov_h"] = f
+                wcs, out = self._run_solver(solver, path, hints, folder)
+                if wcs:
+                    break
             if wcs:
                 data["wcs"] = wcs_payload(wcs, gray.shape)
                 sm = wcs_summary(wcs, gray.shape)
