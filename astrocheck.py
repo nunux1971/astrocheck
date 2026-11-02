@@ -4435,9 +4435,20 @@ class PublishDialog(QDialog):
         if not tok:
             QMessageBox.warning(self, APP_NAME, "Indiquez le jeton du site (voir le README d'ericastro.fr).")
             return
-        if not os.path.isfile(self.image.text().strip()):
+        path = os.path.expanduser(self.image.text().strip())
+        if not path:
             QMessageBox.warning(self, APP_NAME, "Choisissez l'image finale à publier.")
             return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, APP_NAME, f"Image finale introuvable :\n{path}\n\nUtilisez « Choisir… » "
+                                "pour la désigner.")
+            return
+        self.image.setText(path)
+        other = os.path.expanduser(self.solve_image.text().strip())
+        if other and not os.path.isfile(other):
+            QMessageBox.warning(self, APP_NAME, f"Fichier « Pour la résolution » introuvable :\n{other}")
+            return
+        self.solve_image.setText(other)
         if not self.target.text().strip() and not self.replace.currentData():
             QMessageBox.warning(self, APP_NAME, "Indiquez la cible (par exemple IC 1805).")
             return
