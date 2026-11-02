@@ -2345,14 +2345,14 @@ def _rot(xy, deg):
     return xy @ np.array([[c, s], [-s, c]])
 
 
-def match_transform(ref_xy, img_xy, tol=1.5):
+def match_transform(ref_xy, img_xy, tol=1.5, n_ref=MATCH_STARS, n_img=MATCH_STARS):
     """Rotation et décalage qui amènent les étoiles de l'image sur celles de
     la référence : p_ref = R(angle) · p_img + (dx, dy).
     Renvoie {"angle", "dx", "dy", "n"} ou None si le motif n'est pas trouvé.
     Indépendant du sens de rotation et du décalage, robuste aux étoiles
     manquantes ou en plus."""
-    ref = np.asarray(ref_xy, dtype=np.float64)[:MATCH_STARS]
-    img = np.asarray(img_xy, dtype=np.float64)[:MATCH_STARS]
+    ref = np.asarray(ref_xy, dtype=np.float64)[:n_ref]
+    img = np.asarray(img_xy, dtype=np.float64)[:n_img]
     if len(ref) < 6 or len(img) < 6:
         return None
     dr, ar = _pairs(ref)
@@ -2413,6 +2413,104 @@ def match_transform(ref_xy, img_xy, tol=1.5):
     angle = (phi + 180.0) % 360.0 - 180.0
     return {"angle": angle, "dx": float(t[0]), "dy": float(t[1]),
             "n": int(ok.sum())}
+
+
+def find_stars(gray, n=150, k_sigma=5.0):
+    """Étoiles d'une image (2D) : positions (x, y) en pixels, les plus nettes d'abord.
+    Les maxima étendus (filaments de nébuleuse) sont écartés : une étoile se détache
+    nettement de l'anneau qui l'entoure."""
+    a = np.asarray(gray, dtype=np.float32)
+    h, w = a.shape
+    b = 32
+    hb, wb = max(1, h // b), max(1, w // b)
+    blocks = a[:hb * b, :wb * b].reshape(hb, b, wb, b).transpose(0, 2, 1, 3).reshape(hb, wb, -1)
+    bg = np.median(blocks, axis=2)
+    bgf = np.repeat(np.repeat(bg, b, 0), b, 1)
+    bgf = np.pad(bgf, ((0, h - bgf.shape[0]), (0, w - bgf.shape[1])), mode="edge")
+    r = a - bgf
+    sub = subsample(r)
+    sigma = 1.4826 * float(np.median(np.abs(sub - np.median(sub)))) or 1e-6
+    R = 4
+    c = r[R:h - R, R:w - R]
+    m = c > k_sigma * sigma
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy or dx:
+                m &= c >= r[R + dy:h - R + dy, R + dx:w - R + dx]
+    ys, xs = np.nonzero(m)
+    if not len(ys):
+        return np.zeros((0, 2))
+    ys, xs = ys + R, xs + R
+    ring = np.zeros(len(ys), dtype=np.float32)
+    for dy, dx in ((-R, 0), (R, 0), (0, -R), (0, R), (-3, -3), (-3, 3), (3, -3), (3, 3)):
+        ring += r[ys + dy, xs + dx]
+    ring /= 8
+    peak = r[ys, xs]
+    contrast = peak - ring
+    keep = contrast > 0.6 * peak                    # ponctuelle : l'anneau est sombre
+    ys, xs, contrast = ys[keep], xs[keep], contrast[keep]
+    order = np.argsort(-contrast)
+    out = []
+    for i in order:
+        y, x = int(ys[i]), int(xs[i])
+        win = r[y - 1:y + 2, x - 1:x + 2]
+        wsum = float(np.clip(win, 0, None).sum()) or 1.0
+        gy, gx = np.mgrid[-1:2, -1:2]
+        px = x + float((np.clip(win, 0, None) * gx).sum()) / wsum
+        py = y + float((np.clip(win, 0, None) * gy).sum()) / wsum
+        if all((px - q[0]) ** 2 + (py - q[1]) ** 2 > 16 for q in out[-200:]):
+            out.append((px, py))
+        if len(out) >= n:
+            break
+    return np.array(out, dtype=np.float64).reshape(-1, 2)
+
+
+def register_crop(final_gray, stack_gray):
+    """Où l'image finale (recadrée, retournée ou tournée, à la même échelle) se place
+    dans l'empilement. Renvoie (A, T, n) avec  pixel empilement = A · pixel final + T
+    (pixels comptés depuis 0, ligne du haut d'abord), ou None."""
+    k = max(1, int(np.ceil(stack_gray.shape[1] / 2000.0)))
+
+    def red(a):
+        a = np.asarray(a, dtype=np.float32)
+        for _ in range(int(np.log2(k))):
+            a = bin2(a)
+        return a
+    kk = 2 ** int(np.log2(k))                     # facteur réel (puissance de 2)
+    st = red(stack_gray)
+    fi = red(final_gray)
+    ref = find_stars(st, 200)
+    best = None
+    for flip in (False, True):
+        img = fi[::-1] if flip else fi
+        stars = find_stars(img, 150)
+        tr = match_transform(ref, stars, tol=1.5, n_ref=200, n_img=150)
+        if tr and (best is None or tr["n"] > best[1]["n"]):
+            best = (flip, tr)
+    if not best or best[1]["n"] < 8:
+        return None
+    flip, tr = best
+    hb = fi.shape[0]
+
+    def to_stack(p):                               # pixel final pleine résolution → empilement
+        q = (np.asarray(p, float) + 0.5) / kk - 0.5           # réduit
+        if flip:
+            q = np.array([q[0], hb - 1 - q[1]])
+        q = _rot(q[None, :], tr["angle"])[0] + (tr["dx"], tr["dy"])
+        return (q + 0.5) * kk - 0.5
+    T = to_stack((0.0, 0.0))
+    A = np.column_stack([to_stack((1.0, 0.0)) - T, to_stack((0.0, 1.0)) - T])
+    return A, T, best[1]["n"]
+
+
+def transfer_wcs(w, A, T):
+    """Solution de l'empilement → solution de l'image finale, avec
+    pixel empilement = A · pixel final + T (pixels depuis 0 ; FITS = pixel + 1)."""
+    A = np.asarray(A, float)
+    crpix = np.asarray(w["crpix"], float)
+    new_crpix = np.linalg.solve(A, crpix - 1.0 - np.asarray(T, float)) + 1.0
+    return {"crval": tuple(w["crval"]), "crpix": tuple(new_crpix),
+            "cd": np.asarray(w["cd"], float) @ A}
 
 
 def frame_polygon(w, h, tr=None):
@@ -4167,14 +4265,20 @@ class PublishDialog(QDialog):
         form.addRow("Image finale", img_row)
         sol_row = QHBoxLayout()
         self.solve_image = QLineEdit()
-        self.solve_image.setPlaceholderText("facultatif : la même image, même cadrage, avant la réduction d'étoiles")
+        self.solve_image.setPlaceholderText("facultatif : l'empilement FITS, ou l'image avant réduction d'étoiles (même cadrage)")
         self.solve_image.setToolTip("La réduction d'étoiles empêche souvent ASTAP de reconnaître le champ. "
-                                    "Cette image sert seulement à la résolution ; c'est l'image finale qui est publiée.")
+                                    "Avec l'empilement FITS (non recadré), AstroCheck le résout puis retrouve où "
+                                    "l'image finale s'y place. C'est toujours l'image finale qui est publiée.")
         pick2 = QPushButton("Choisir…")
         pick2.clicked.connect(lambda: self.pick_image(self.solve_image))
         sol_row.addWidget(self.solve_image, 1)
         sol_row.addWidget(pick2)
         form.addRow("Pour la résolution", sol_row)
+        self.send_fits = QCheckBox("Envoyer aussi ce FITS au site (conservé sur le serveur, jamais affiché)")
+        self.send_fits.setEnabled(False)
+        self.solve_image.textChanged.connect(
+            lambda t: self.send_fits.setEnabled(t.strip().lower().endswith(FITS_EXT)))
+        form.addRow("", self.send_fits)
         self.target = QLineEdit(target or "")
         self.target.editingFinished.connect(self.lookup_target)
         form.addRow("Cible", self.target)
@@ -4319,8 +4423,10 @@ class PublishDialog(QDialog):
     def pick_image(self, edit=None):
         edit = edit or self.image
         start = os.path.dirname(edit.text() or self.image.text()) or os.path.expanduser("~")
-        f, _ = QFileDialog.getOpenFileName(self, "Image", start,
-                                           "Images (*.jpg *.jpeg *.png *.tif *.tiff *.webp)")
+        filt = "Images (*.jpg *.jpeg *.png *.tif *.tiff *.webp)"
+        if edit is self.solve_image:
+            filt = "Empilement ou image (*.fit *.fits *.fts *.jpg *.jpeg *.png *.tif *.tiff);;" + filt
+        f, _ = QFileDialog.getOpenFileName(self, "Image", start, filt)
         if f:
             edit.setText(f)
 
@@ -7128,11 +7234,12 @@ class MainWindow(QMainWindow):
         base, tok = dlg.site()
         msg = self.publish(base, tok, dlg.image.text().strip(), dlg.payload(),
                            dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None,
-                           dlg.solve_image.text().strip() or None)
+                           dlg.solve_image.text().strip() or None,
+                           dlg.send_fits.isEnabled() and dlg.send_fits.isChecked())
         if msg:
             self.show_publish_result(*msg)
 
-    def publish(self, base, token, src, data, solve, catalogue, fov=None, solve_src=None):
+    def publish(self, base, token, src, data, solve, catalogue, fov=None, solve_src=None, send_fits=False):
         """Prépare l'image, la résout, l'envoie. Renvoie (ok, texte, réponse)."""
         folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                               APP_ID, "publier")
@@ -7142,6 +7249,7 @@ class MainWindow(QMainWindow):
             return False, ("Image illisible. Pour un TIFF 16 bits, exportez d'abord un JPEG "
                            "depuis votre logiciel de traitement."), None
         src_height = img.height()                         # avant toute réduction pour l'envoi
+        full = img
         big = max(img.width(), img.height())
         if src.lower().endswith((".jpg", ".jpeg")) and big <= SITE_COTE_MAX:
             with open(src, "rb") as f:                   # JPEG déjà prêt : envoyé tel quel
@@ -7157,20 +7265,20 @@ class MainWindow(QMainWindow):
                 jpeg = f.read()
             img = QImage(out)
         note = ""
+        original = None
+        is_fits = bool(solve_src) and solve_src.lower().endswith(FITS_EXT)
+        if solve or (is_fits and send_fits):
+            if is_fits and send_fits:
+                try:
+                    with open(solve_src, "rb") as f:
+                        original = (os.path.basename(solve_src), f.read(), "application/fits")
+                except OSError as e:
+                    return False, f"FITS illisible : {e}", None
         if solve:
-            small = img
-            if solve_src:                                 # version sans réduction d'étoiles, même cadrage
-                other = QImage(solve_src)
-                if other.isNull():
-                    return False, "L'image pour la résolution est illisible.", None
-                if abs(other.width() / other.height() - img.width() / img.height()) > 0.01:
-                    return False, (f"L'image pour la résolution ({other.width()} × {other.height()}) n'a pas "
-                                   f"le même cadrage que l'image finale : la grille serait décalée."), None
-                small = other
-            if max(small.width(), small.height()) > 2400:     # plus rapide, et assez précis pour le site
-                small = small.scaled(2400, 2400, Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
-            gray = qimage_gray(small)
+            solver = self.find_solver()
+            hints = {"ra": None, "dec": None, "scale": None, "fov_h": None}
+            if catalogue and catalogue.get("ra") is not None:
+                hints["ra"], hints["dec"] = catalogue["ra"], catalogue["dec"]
             path = os.path.join(folder, "solve.fit")
             for old in os.listdir(folder):
                 if old.startswith("solve"):
@@ -7178,17 +7286,47 @@ class MainWindow(QMainWindow):
                         os.remove(os.path.join(folder, old))
                     except OSError:
                         pass
-            fits.PrimaryHDU(data=np.ascontiguousarray(gray)).writeto(path, overwrite=True)
-            hints = {"ra": None, "dec": None, "scale": None, "fov_h": None}
-            if catalogue and catalogue.get("ra") is not None:
-                hints["ra"], hints["dec"] = catalogue["ra"], catalogue["dec"]
-            solver = self.find_solver()
-            wcs, out = None, ""
-            # d'abord avec le champ attendu de l'instrument (ASTAP en a besoin à ±10 %),
-            # puis un peu plus petit (image recadrée), puis en laissant ASTAP chercher
-            # champ saisi, sinon calculé : image recadrée à l'échelle des brutes, entière, ou drizzle ×2
-            candidates = [fov] if fov else fov_candidates(data.get("instruments") or [], src_height, gray.shape)
+            if is_fits:
+                # empilement : résolu entier, puis l'image finale y est replacée par ses étoiles
+                try:
+                    sdata, sheader, _bp = read_fits(solve_src)
+                except Exception as e:  # noqa: BLE001
+                    return False, f"FITS illisible : {e}", None
+                mono = sdata.mean(axis=2) if sdata.ndim == 3 else sdata
+                hdr = fits.Header()
+                for k in ("OBJECT", "DATE-OBS", "RA", "DEC", "OBJCTRA", "OBJCTDEC"):
+                    if k in sheader:
+                        hdr[k] = sheader[k]
+                fits.PrimaryHDU(data=np.ascontiguousarray(mono, dtype=np.float32), header=hdr).writeto(path, overwrite=True)
+                h = solve_hints(sheader, 1, mono.shape)
+                for k in ("ra", "dec"):
+                    if h.get(k) is not None:
+                        hints[k] = h[k]
+                candidates = [fov] if fov else []
+                for f in (h.get("fov_h"), rig_fov(data.get("instruments") or [], mono.shape)):
+                    if f and all(abs(f - g) / g > 0.08 for g in candidates):
+                        candidates.append(float(f))
+                solved_shape = mono.shape
+            else:
+                small = img
+                if solve_src:                             # version sans réduction d'étoiles, même cadrage
+                    other = QImage(solve_src)
+                    if other.isNull():
+                        return False, "L'image pour la résolution est illisible.", None
+                    if abs(other.width() / other.height() - img.width() / img.height()) > 0.01:
+                        return False, (f"L'image pour la résolution ({other.width()} × {other.height()}) n'a pas "
+                                       f"le même cadrage que l'image finale : la grille serait décalée."), None
+                    small = other
+                if max(small.width(), small.height()) > 2400:     # plus rapide, et assez précis pour le site
+                    small = small.scaled(2400, 2400, Qt.AspectRatioMode.KeepAspectRatio,
+                                         Qt.TransformationMode.SmoothTransformation)
+                gray = qimage_gray(small)
+                fits.PrimaryHDU(data=np.ascontiguousarray(gray)).writeto(path, overwrite=True)
+                # champ saisi, sinon calculé : image recadrée à l'échelle des brutes, entière, ou drizzle ×2
+                candidates = [fov] if fov else fov_candidates(data.get("instruments") or [], src_height, gray.shape)
+                solved_shape = gray.shape
             fov = candidates[0] if candidates else None
+            wcs, out = None, ""
             tried, first_out = [], ""
             for f in candidates + [None]:
                 if not solver:
@@ -7199,22 +7337,36 @@ class MainWindow(QMainWindow):
                 first_out = first_out or out
                 if wcs:
                     break
+            failure = None
+            if wcs and is_fits:
+                final_gray = qimage_gray(full)
+                reg = register_crop(final_gray, mono)
+                if reg:
+                    wcs = transfer_wcs(wcs, reg[0], reg[1])
+                    solved_shape = final_gray.shape
+                else:
+                    wcs = None
+                    failure = ("L'empilement est résolu, mais l'image finale n'a pas pu y être replacée : "
+                               "ses étoiles ne correspondent pas à celles de l'empilement (image "
+                               "redimensionnée ou drizzle ? autre empilement ?).")
             if wcs:
-                data["wcs"] = wcs_payload(wcs, gray.shape)
-                sm = wcs_summary(wcs, gray.shape)
-                note = (f"Résolue : centre RA {ra_text(sm['ra'])}, DEC {dec_text(sm['dec'])}, "
-                        f"champ {fr(sm['fov'][0], 2)}° × {fr(sm['fov'][1], 2)}°"
+                data["wcs"] = wcs_payload(wcs, solved_shape)
+                sm = wcs_summary(wcs, solved_shape)
+                note = (f"Résolue{' (par l’empilement)' if is_fits else ''} : centre RA {ra_text(sm['ra'])}, "
+                        f"DEC {dec_text(sm['dec'])}, champ {fr(sm['fov'][0], 2)}° × {fr(sm['fov'][1], 2)}°"
                         # FITS écrit ligne du haut en premier : à l'écran, det < 0 = miroir
                         + (", image en miroir" if np.linalg.det(np.asarray(wcs["cd"], float)) < 0 else "") + ".")
             else:
-                hint = ("Essais : " + ", ".join(tried) + ". Si l'instrument coché n'est pas celui de "
-                        "la photo, corrigez-le ou indiquez le « Champ vertical ». Après une réduction "
-                        "d'étoiles, donnez la version d'avant dans « Pour la résolution »." if fov else
-                        "Aucun instrument connu n'est coché : ASTAP ne connaît pas la taille du champ. "
-                        "Cochez l'instrument de la photo, ou indiquez le « Champ vertical », et recommencez.")
-                ask = QMessageBox.question(
-                    self, APP_NAME, (self._solver_failure(solver, first_out) if solver else "Aucun solveur.")
-                    + "\n\n" + hint + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
+                if failure:
+                    text = failure
+                else:
+                    hint = ("Essais : " + ", ".join(tried) + ". Si l'instrument coché n'est pas celui de "
+                            "la photo, corrigez-le ou indiquez le « Champ vertical ». Après une réduction "
+                            "d'étoiles, donnez l'empilement FITS dans « Pour la résolution »." if fov else
+                            "Aucun instrument connu n'est coché : ASTAP ne connaît pas la taille du champ. "
+                            "Cochez l'instrument de la photo, ou indiquez le « Champ vertical », et recommencez.")
+                    text = (self._solver_failure(solver, first_out) if solver else "Aucun solveur.") + "\n\n" + hint
+                ask = QMessageBox.question(self, APP_NAME, text + "\n\nEnvoyer quand même, sans grille ni noms d'objets ?")
                 if ask != QMessageBox.StandardButton.Yes:
                     return None
                 note = "Image non résolue : pas de grille ni de noms d'objets sur le site."
@@ -7222,11 +7374,15 @@ class MainWindow(QMainWindow):
         result = {}
 
         def work():
+            files = {"image": ("image.jpg", jpeg, "image/jpeg")}
+            if original:
+                files["original"] = original
             result["r"] = site_request(base, token, "/api/photos/", fields={"donnees": json.dumps(data, ensure_ascii=False)},
-                                       files={"image": ("image.jpg", jpeg, "image/jpeg")}, timeout=600)
+                                       files=files, timeout=900)
         th = threading.Thread(target=work, daemon=True)
         th.start()
-        prog = QProgressDialog(f"Envoi de l'image ({len(jpeg) / 1e6:.1f} Mo)…", "", 0, 0, self)
+        size = (len(jpeg) + (len(original[1]) if original else 0)) / 1e6
+        prog = QProgressDialog(f"Envoi {'de l’image et du FITS' if original else 'de l’image'} ({size:.1f} Mo)…", "", 0, 0, self)
         prog.setCancelButton(None)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
         prog.setMinimumDuration(0)
