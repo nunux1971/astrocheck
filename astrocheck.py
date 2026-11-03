@@ -4308,7 +4308,23 @@ class PublishDialog(QDialog):
         form.addRow("Cible", self.target)
         self.replace = QComboBox()
         self.replace.addItem("Nouvelle photo", "")
+        self.replace.currentIndexChanged.connect(self.mode_changed)
         form.addRow("Sur le site", self.replace)
+        vrow = QHBoxLayout()
+        self.version_name = QLineEdit()
+        self.version_name.setPlaceholderText("RGB, HOO, Hubble… (facultatif pour une photo seule)")
+        self.version_palette = QLineEdit()
+        self.version_palette.setPlaceholderText("palette : Hα + OIII, SHO synthétique…")
+        vrow.addWidget(self.version_name, 1)
+        vrow.addWidget(self.version_palette, 1)
+        form.addRow("Version", vrow)
+        nrow = QHBoxLayout()
+        self.version_note = QLineEdit()
+        self.version_note.setPlaceholderText("facultatif : ce que change ce traitement")
+        self.version_main = QCheckBox("Version principale (vignette de la galerie)")
+        nrow.addWidget(self.version_note, 1)
+        nrow.addWidget(self.version_main)
+        form.addRow("Note de version", nrow)
         self.title_fr = QLineEdit()
         self.title_fr.setPlaceholderText("vide : le nom de la cible")
         self.title_en = QLineEdit()
@@ -4407,7 +4423,9 @@ class PublishDialog(QDialog):
         self.replace.clear()
         self.replace.addItem("Nouvelle photo", "")
         for p in self.existing:
-            self.replace.addItem(f"Remplacer « {p['titre']} »" + ("" if p.get("publiee") else " (brouillon)"), p["slug"])
+            draft = "" if p.get("publiee") else " (brouillon)"
+            self.replace.addItem(f"Ajouter une version à « {p['titre']} »{draft}", "version:" + p["slug"])
+            self.replace.addItem(f"Remplacer « {p['titre']} »{draft}", p["slug"])
         c = self.catalogue
         self.site_state.setText(
             (f"{name} : {c['designation']}" + (f" · {c['nom_fr']}" if c.get("nom_fr") else "")
@@ -4475,6 +4493,9 @@ class PublishDialog(QDialog):
             QMessageBox.warning(self, APP_NAME, f"Fichier « Pour la résolution » introuvable :\n{other}")
             return
         self.solve_image.setText(other)
+        if self.mode()[0] == "version" and not self.version_name.text().strip():
+            QMessageBox.warning(self, APP_NAME, "Donnez un nom à cette version (HOO, Hubble…).")
+            return
         if not self.target.text().strip() and not self.replace.currentData():
             QMessageBox.warning(self, APP_NAME, "Indiquez la cible (par exemple IC 1805).")
             return
@@ -4485,15 +4506,47 @@ class PublishDialog(QDialog):
         st.setValue("site/traitement", self.processing.text().strip())
         self.accept()
 
+    def mode(self):
+        """("nouvelle", None), ("version", slug) ou ("remplacer", slug)."""
+        d = self.replace.currentData() or ""
+        if d.startswith("version:"):
+            return "version", d[8:]
+        return ("remplacer", d) if d else ("nouvelle", None)
+
+    def mode_changed(self, *_):
+        kind, _slug = self.mode()
+        is_version = kind == "version"
+        self.version_main.setEnabled(is_version)
+        for w in (self.title_fr, self.title_en, self.text_fr, self.text_en, self.filters, self.processing, self.table):
+            w.setEnabled(not is_version)            # une version reprend la fiche de la photo
+        for cb in self.rig_boxes.values():
+            cb.setEnabled(not is_version)
+        if is_version and self.solve.isEnabled():
+            self.solve.setChecked(False)            # même cadrage : la solution de la photo sert
+            self.solve.setText("Résoudre l'image (seulement si son cadrage diffère de la photo)")
+        elif self.solve.isEnabled():
+            self.solve.setChecked(True)
+            self.solve.setText("Résoudre l'image finale (grille RA/DEC et noms d'objets sur le site)")
+
     def payload(self):
+        kind, slug = self.mode()
+        if kind == "version":
+            return {"version_de": slug, "version_nom": self.version_name.text().strip(),
+                    "version_palette": self.version_palette.text().strip(),
+                    "version_note_fr": self.version_note.text().strip(),
+                    "principale": self.version_main.isChecked(), "designation": self.target.text().strip()}
         d = {"designation": self.target.text().strip(),
              "titre_fr": self.title_fr.text().strip(), "titre_en": self.title_en.text().strip(),
              "texte_fr": self.text_fr.toPlainText().strip(), "texte_en": self.text_en.toPlainText().strip(),
              "filtres": self.filters.text().strip(), "traitement": self.processing.text().strip(),
              "instruments": [c for c, cb in self.rig_boxes.items() if cb.isChecked()],
              "seances": self.chosen_sessions(), "publier": self.publish_now.isChecked()}
-        if self.replace.currentData():
-            d["remplacer"] = self.replace.currentData()
+        for k, w in (("version_nom", self.version_name), ("version_palette", self.version_palette),
+                     ("version_note_fr", self.version_note)):
+            if w.text().strip():
+                d[k] = w.text().strip()
+        if kind == "remplacer":
+            d["remplacer"] = slug
             for k in ("titre_fr", "titre_en", "texte_fr", "texte_en"):   # vide : on garde le texte du site
                 if not d[k]:
                     del d[k]
@@ -7428,6 +7481,8 @@ class MainWindow(QMainWindow):
             time.sleep(0.05)
         prog.close()
         code, body = result.get("r", (0, {"erreur": "pas de réponse"}))
+        if code in (200, 201) and body.get("version"):
+            return True, f"Version « {body['version']} » ajoutée à la photo.\n{note}", body
         if code in (200, 201):
             etat = "en ligne" if body.get("publiee") else "enregistrée en brouillon : relisez-la puis cochez « publiée » dans l'administration"
             return True, f"Photo {etat}.\n{note}", body
