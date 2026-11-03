@@ -4364,6 +4364,29 @@ class PublishDialog(QDialog):
         form.addRow("Champ vertical", self.fov)
         lay.addLayout(form)
 
+        vhead = QHBoxLayout()
+        vhead.addWidget(QLabel("Autres versions de la même image (HOO, Hubble…) :"), 1)
+        addv = QPushButton("Ajouter des versions…")
+        addv.clicked.connect(self.add_versions)
+        delv = QPushButton("Retirer")
+        delv.clicked.connect(self.remove_version)
+        vhead.addWidget(addv)
+        vhead.addWidget(delv)
+        lay.addLayout(vhead)
+        self.vtable = QTableWidget(0, 4)
+        self.vtable.setHorizontalHeaderLabels(["Fichier", "Nom", "Palette", "Note"])
+        self.vtable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.vtable.setMinimumHeight(90)
+        self.vtable.itemChanged.connect(lambda *_: self.refresh_main_choice())
+        lay.addWidget(self.vtable)
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Mise en avant (vignette de la galerie) :"))
+        self.main_choice = QComboBox()
+        mrow.addWidget(self.main_choice, 1)
+        lay.addLayout(mrow)
+        self.version_name.textChanged.connect(lambda *_: self.refresh_main_choice())
+        self.refresh_main_choice()
+
         lay.addWidget(QLabel("Nuits de pose (journal d'AstroCheck) :"))
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Nuit", "Instrument", "Filtre", "Poses gardées", "Total", "FWHM"])
@@ -4493,6 +4516,17 @@ class PublishDialog(QDialog):
             QMessageBox.warning(self, APP_NAME, f"Fichier « Pour la résolution » introuvable :\n{other}")
             return
         self.solve_image.setText(other)
+        for v in self.extra_versions():
+            if not v["nom"]:
+                QMessageBox.warning(self, APP_NAME, f"Donnez un nom à la version {os.path.basename(v['path'])}.")
+                return
+            if not os.path.isfile(v["path"]):
+                QMessageBox.warning(self, APP_NAME, f"Version introuvable :\n{v['path']}")
+                return
+        if self.vtable.rowCount() and not self.version_name.text().strip():
+            QMessageBox.warning(self, APP_NAME, "Donnez aussi un nom à l'image finale (RGB par exemple) : "
+                                "c'est le nom de son onglet sur le site.")
+            return
         if self.mode()[0] == "version" and not self.version_name.text().strip():
             QMessageBox.warning(self, APP_NAME, "Donnez un nom à cette version (HOO, Hubble…).")
             return
@@ -4505,6 +4539,59 @@ class PublishDialog(QDialog):
         st.setValue("site/derniere_image", self.image.text().strip())
         st.setValue("site/traitement", self.processing.text().strip())
         self.accept()
+
+    @staticmethod
+    def guess_version_name(path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        last = re.split(r"[_\-\s]+", stem)[-1]
+        known = {"rgb": "RGB", "hoo": "HOO", "sho": "Hubble (SHO)", "hubble": "Hubble", "hso": "HSO",
+                 "starless": "Sans étoiles", "ha": "Hα", "oiii": "OIII"}
+        return known.get(last.lower(), last.upper() if len(last) <= 4 else last.capitalize())
+
+    def add_versions(self):
+        start = os.path.dirname(self.image.text()) or os.path.expanduser("~")
+        files, _ = QFileDialog.getOpenFileNames(self, "Autres versions", start,
+                                                "Images (*.jpg *.jpeg *.png *.tif *.tiff *.webp)")
+        self.vtable.blockSignals(True)
+        for f in files:
+            r = self.vtable.rowCount()
+            self.vtable.insertRow(r)
+            it = QTableWidgetItem(os.path.basename(f))
+            it.setData(Qt.ItemDataRole.UserRole, f)
+            it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.vtable.setItem(r, 0, it)
+            self.vtable.setItem(r, 1, QTableWidgetItem(self.guess_version_name(f)))
+            self.vtable.setItem(r, 2, QTableWidgetItem(""))
+            self.vtable.setItem(r, 3, QTableWidgetItem(""))
+        self.vtable.blockSignals(False)
+        if files and not self.version_name.text().strip():
+            self.version_name.setText(self.guess_version_name(self.image.text()) if self.image.text() else "RGB")
+        self.refresh_main_choice()
+
+    def remove_version(self):
+        rows = sorted({i.row() for i in self.vtable.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.vtable.removeRow(r)
+        self.refresh_main_choice()
+
+    def extra_versions(self):
+        out = []
+        for r in range(self.vtable.rowCount()):
+            cell = lambda c: (self.vtable.item(r, c).text().strip() if self.vtable.item(r, c) else "")  # noqa: E731
+            out.append({"path": self.vtable.item(r, 0).data(Qt.ItemDataRole.UserRole),
+                        "nom": cell(1), "palette": cell(2), "note": cell(3)})
+        return out
+
+    def refresh_main_choice(self):
+        keep = self.main_choice.currentIndex()
+        self.main_choice.blockSignals(True)
+        self.main_choice.clear()
+        self.main_choice.addItem(f"l'image finale ({self.version_name.text().strip() or 'sans nom'})")
+        for v in self.extra_versions():
+            self.main_choice.addItem(v["nom"] or os.path.basename(v["path"]))
+        self.main_choice.setCurrentIndex(keep if 0 <= keep < self.main_choice.count() else 0)
+        self.main_choice.blockSignals(False)
+        self.main_choice.setEnabled(self.vtable.rowCount() > 0 or self.mode()[0] == "version")
 
     def mode(self):
         """("nouvelle", None), ("version", slug) ou ("remplacer", slug)."""
@@ -4534,7 +4621,8 @@ class PublishDialog(QDialog):
             return {"version_de": slug, "version_nom": self.version_name.text().strip(),
                     "version_palette": self.version_palette.text().strip(),
                     "version_note_fr": self.version_note.text().strip(),
-                    "principale": self.version_main.isChecked(), "designation": self.target.text().strip()}
+                    "principale": self.version_main.isChecked() or (self.vtable.rowCount() > 0 and self.main_choice.currentIndex() == 0),
+                    "designation": self.target.text().strip()}
         d = {"designation": self.target.text().strip(),
              "titre_fr": self.title_fr.text().strip(), "titre_en": self.title_en.text().strip(),
              "texte_fr": self.text_fr.toPlainText().strip(), "texte_en": self.text_en.toPlainText().strip(),
@@ -7322,12 +7410,85 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         base, tok = dlg.site()
-        msg = self.publish(base, tok, dlg.image.text().strip(), dlg.payload(),
+        data = dlg.payload()
+        msg = self.publish(base, tok, dlg.image.text().strip(), data,
                            dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None,
                            dlg.solve_image.text().strip() or None,
                            dlg.send_fits.isEnabled() and dlg.send_fits.isChecked())
+        extras = dlg.extra_versions()
+        if msg and msg[0] and extras:
+            ok, text, body = msg
+            slug = data.get("version_de") or body.get("slug")
+            choice = dlg.main_choice.currentIndex()        # 0 : l'image finale ; k : la k-ième version
+            lines = [text]
+            for k, v in enumerate(extras, 1):
+                r = self.publish_version(base, tok, slug, v, principale=(choice == k), main_src=dlg.image.text().strip(),
+                                         instruments=data.get("instruments") or [], catalogue=dlg.catalogue,
+                                         label=f"{k}/{len(extras)}")
+                lines.append(r)
+            msg = (ok, "\n".join(lines), body)
         if msg:
             self.show_publish_result(*msg)
+
+    def publish_version(self, base, token, slug, v, principale, main_src, instruments, catalogue, label=""):
+        """Envoie une autre version d'une photo ; renvoie une ligne de bilan."""
+        folder = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), APP_ID, "publier")
+        os.makedirs(folder, exist_ok=True)
+        img = QImage(v["path"])
+        if img.isNull():
+            return f"• {v['nom']} : image illisible, non envoyée."
+        if v["path"].lower().endswith((".jpg", ".jpeg")) and max(img.width(), img.height()) <= SITE_COTE_MAX:
+            with open(v["path"], "rb") as f:
+                jpeg = f.read()
+        else:
+            small = img
+            if max(img.width(), img.height()) > SITE_COTE_MAX:
+                small = img.scaled(SITE_COTE_MAX, SITE_COTE_MAX, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            out = os.path.join(folder, "version.jpg")
+            if not small.convertToFormat(QImage.Format.Format_RGB888).save(out, "JPG", 92):
+                return f"• {v['nom']} : conversion en JPEG impossible."
+            with open(out, "rb") as f:
+                jpeg = f.read()
+        data = {"version_de": slug, "version_nom": v["nom"], "version_palette": v["palette"],
+                "version_note_fr": v["note"], "principale": principale}
+        note = ""
+        main = QImage(main_src)
+        if not main.isNull() and abs(img.width() / img.height() - main.width() / main.height()) > 0.01:
+            # cadrage différent de l'image finale : cette version a besoin de sa propre solution
+            solver = self.find_solver()
+            wcs = None
+            if solver:
+                s2 = img if max(img.width(), img.height()) <= 2400 else img.scaled(
+                    2400, 2400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                gray = qimage_gray(s2)
+                path = os.path.join(folder, "solve_version.fit")
+                fits.PrimaryHDU(data=np.ascontiguousarray(gray)).writeto(path, overwrite=True)
+                hints = {"ra": (catalogue or {}).get("ra"), "dec": (catalogue or {}).get("dec"), "scale": None, "fov_h": None}
+                for f in fov_candidates(instruments, img.height(), gray.shape) + [None]:
+                    hints["fov_h"] = f
+                    wcs, _out = self._run_solver(solver, path, hints, folder)
+                    if wcs:
+                        data["wcs"] = wcs_payload(wcs, gray.shape)
+                        break
+            note = " (cadrage différent : résolue à part)" if wcs else " (cadrage différent et non résolue : grille absente)"
+        result = {}
+        th = threading.Thread(target=lambda: result.update(r=site_request(
+            base, token, "/api/photos/", fields={"donnees": json.dumps(data, ensure_ascii=False)},
+            files={"image": ("version.jpg", jpeg, "image/jpeg")}, timeout=900)), daemon=True)
+        th.start()
+        prog = QProgressDialog(f"Envoi de la version {v['nom']} {label}…", "", 0, 0, self)
+        prog.setCancelButton(None)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        while th.is_alive():
+            QApplication.processEvents()
+            time.sleep(0.05)
+        prog.close()
+        code, body = result.get("r", (0, {"erreur": "pas de réponse"}))
+        if code in (200, 201):
+            return f"• Version « {v['nom']} » ajoutée{' et mise en avant' if principale else ''}{note}."
+        return f"• Version « {v['nom']} » : {site_error(code, body)}"
 
     def publish(self, base, token, src, data, solve, catalogue, fov=None, solve_src=None, send_fits=False):
         """Prépare l'image, la résout, l'envoie. Renvoie (ok, texte, réponse)."""
