@@ -7450,8 +7450,12 @@ class MainWindow(QMainWindow):
 
     # -- envoi du journal au serveur d'AstroPlan
     def start_journal_upload(self, path, template=None):
-        """Lance la commande d'envoi en arrière-plan ; renvoie True si lancée."""
+        """Envoie le journal : au site par son API si le jeton est réglé (fenêtre Publier),
+        sinon par la commande réglée. Renvoie True si l'envoi est lancé."""
         if template is None:
+            token = settings().value("site/jeton", "") or ""
+            if token:
+                return self.start_journal_api(path, settings().value("site/url", SITE_DEFAUT) or SITE_DEFAUT, token)
             template = settings().value("journal/upload", "") or ""
         cmd = upload_command(template, path)
         if not cmd:
@@ -7473,6 +7477,51 @@ class MainWindow(QMainWindow):
             self._upload_timer = QTimer(self)
             self._upload_timer.timeout.connect(self._poll_upload)
         self._upload_timer.start(500)
+        return True
+
+    def start_journal_api(self, path, base, token):
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError as e:
+            self.statusBar().showMessage(f"Journal illisible : {e}", 10000)
+            return False
+        result = {}
+
+        def work():
+            url = base.rstrip("/") + "/api/journal/"
+            req = urllib.request.Request(url, data=body, method="POST", headers={
+                "Authorization": f"Bearer {token}", "Content-Type": "application/json", "User-Agent": APP_NAME})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    result["r"] = (r.status, json.loads(r.read().decode("utf-8") or "{}"))
+            except urllib.error.HTTPError as e:
+                try:
+                    result["r"] = (e.code, json.loads(e.read().decode("utf-8") or "{}"))
+                except ValueError:
+                    result["r"] = (e.code, {})
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                result["r"] = (0, {"erreur": str(getattr(e, "reason", e))})
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        self.statusBar().showMessage("Envoi du journal au site…")
+
+        def poll():
+            if th.is_alive():
+                return
+            timer.stop()
+            code, b = result.get("r", (0, {}))
+            if code == 200:
+                self.statusBar().showMessage(
+                    f"Journal envoyé au site : {b.get('ajoutees', 0)} séance(s) nouvelle(s), "
+                    f"{b.get('mises_a_jour', 0)} mise(s) à jour. AstroPlan est à jour.", 10000)
+            else:
+                self.statusBar().showMessage(f"Échec de l'envoi du journal : {site_error(code, b)}", 20000)
+            self._upload_last = (code, b)
+        timer = QTimer(self)
+        timer.timeout.connect(poll)
+        timer.start(300)
+        self._journal_timer = timer
         return True
 
     def _poll_upload(self):
@@ -7509,7 +7558,9 @@ class MainWindow(QMainWindow):
             "AstroPlan sur votre serveur. {fichier} est remplacé par le chemin "
             "du journal. Laissez vide pour ne rien envoyer.\n\n"
             "La commande ne doit pas demander de mot de passe : utilisez une clé "
-            "SSH (ssh-keygen puis ssh-copy-id), voir le README d'AstroPlan.")
+            "SSH (ssh-keygen puis ssh-copy-id), voir le README d'AstroPlan.\n\n"
+            "Avec ericastro.fr : dès que le jeton du site est réglé (Analyse ▸ Publier une image "
+            "sur le site), le journal part directement au site et cette commande ne sert plus.")
         info.setWordWrap(True)
         lay.addWidget(info)
         edit = QLineEdit(settings().value("journal/upload", "") or "")
