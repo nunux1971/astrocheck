@@ -22,6 +22,7 @@ Pensé pour l'ASIAIR et le **Dwarf 3**, il fonctionne avec tout logiciel d'acqui
 - **Aperçu d'empilement rapide** : les brutes gardées alignées et empilées en quelques secondes, comparées à une image seule et à l'empilement avec les rejetées, avec **résolution astrométrique** (ASTAP ou Siril) et grille RA/DEC.
 - **Journal pour AstroPlan**, envoyé automatiquement sur le serveur si vous le souhaitez.
 - **Séries** : caméras TELE et WIDE du Dwarf 3, filtres, poses et gains traités séparément.
+- **Empilement des vidéos de la Lune, du Soleil et des planètes** (MP4 du Dwarf 3, SER) : tri des images par netteté, alignement au sous-pixel, moyenne des meilleures, accentuation par ondelettes réglable, puis publication sur le site en un clic.
 - **Export** vers Siril ou PixInsight, avec script de prétraitement Siril, score en mot-clé FITS (`ACWEIGHT`) pour ImageIntegration, et compositions HOO / SHO synthétique pour les filtres bi-bande.
 
 Vos fichiers ne sont jamais modifiés : les rejets se font dans la liste, et rien ne bouge sur le disque sans votre accord.
@@ -43,7 +44,7 @@ Puis, dans le dossier du dépôt :
 sh installer_astrocheck.sh
 ```
 
-AstroCheck apparaît dans le menu des applications. Pour lire les CR2, installez aussi `dcraw` (ou le module Python `rawpy`).
+AstroCheck apparaît dans le menu des applications. Pour lire les CR2, installez aussi `dcraw` (ou le module Python `rawpy`) ; pour empiler les vidéos MP4, `ffmpeg`.
 
 Sans installation, vous pouvez aussi le lancer directement :
 
@@ -58,6 +59,7 @@ python3 astrocheck.py ~/Astro/NGC7380
 3. Parcourez-les avec ↑ ↓, **Espace** pour garder ou rejeter.
 4. **Ctrl+B** : bilan de la séance, **Ctrl+U** : rotation et zone utile.
 5. **Ctrl+Maj+S** : exporter vers PixInsight ou Siril.
+6. **Ctrl+Maj+V**, ou glisser un MP4 sur la fenêtre : empiler une vidéo de la Lune, du Soleil ou d'une planète.
 
 La notice complète est dans [NOTICE.md](NOTICE.md).
 

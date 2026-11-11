@@ -18,6 +18,7 @@ Vous aviez fitsview ?
 Première installation (Debian, Ubuntu, Mint)
   sudo apt install python3-pyqt6 python3-numpy python3-astropy
   sudo apt install dcraw   # seulement pour lire les fichiers CR2
+  sudo apt install ffmpeg  # seulement pour empiler les vidéos MP4 (Dwarf 3)
   sh installer_astrocheck.sh
 
 Nouveau dans cette version : PyQt6
