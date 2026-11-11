@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QAbstractItemView, QProgressDialog, QSpinBox,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QDialog, QDialogButtonBox,
     QFormLayout, QDoubleSpinBox, QRadioButton, QLineEdit, QPushButton,
-    QGroupBox, QHBoxLayout, QDockWidget, QToolTip, QTabBar, QMenu,
+    QGroupBox, QHBoxLayout, QDockWidget, QToolTip, QTabBar, QMenu, QSlider, QProgressBar,
     QTableWidget, QTableWidgetItem,
 )
 
@@ -3292,6 +3292,302 @@ def export_size(srcs, link=False, raw_to_fits=False):
 
 
 # ----------------------------------------------------------------------------
+# Vidéos de la Lune, du Soleil et des planètes (MP4 du Dwarf 3, SER) :
+# empilement des meilleures images (« lucky imaging »)
+# ----------------------------------------------------------------------------
+
+VIDEO_EXT = (".mp4", ".mov", ".m4v", ".avi", ".mkv")
+
+
+def is_video(path):
+    return path.lower().endswith(VIDEO_EXT)
+
+
+def find_ffmpeg():
+    """(ffmpeg, ffprobe) ou (None, None) : ffmpeg décode les MP4."""
+    a, b = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    return (a, b) if a and b else (None, None)
+
+
+class VideoSource:
+    """Images d'une vidéo, lues au fil de l'eau (jamais toute la vidéo en mémoire).
+    MP4/MOV/AVI par ffmpeg ; SER directement. Images rendues en float32, RVB ou mono."""
+
+    def __init__(self, path):
+        self.path = path
+        self.ser = None
+        self.date = None
+        if is_ser(path):
+            self.ser = open_ser(path)
+            self.width, self.height, self.count = self.ser.width, self.ser.height, self.ser.count
+            self.bayer = SER_BAYER.get(self.ser.color_id)
+            if self.bayer:
+                self.width, self.height = self.width // 2, self.height // 2
+            self.fps = None
+            self.maxval = 255.0 if self.ser.bpp == 1 else float(2 ** self.ser.depth - 1)
+            if self.ser.timestamps is not None:
+                self.date = ticks_to_datetime(self.ser.timestamps[0])
+            return
+        ffmpeg, ffprobe = find_ffmpeg()
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg n'est pas installé : sudo apt install ffmpeg")
+        out = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=width,height,nb_frames,avg_frame_rate,duration:"
+                              "format=duration:format_tags=creation_time",
+                              "-of", "json", path], capture_output=True, text=True, timeout=60)
+        if out.returncode:
+            raise ValueError(out.stderr.strip() or "vidéo illisible")
+        info = json.loads(out.stdout or "{}")
+        st = (info.get("streams") or [{}])[0]
+        self.width, self.height = int(st.get("width") or 0), int(st.get("height") or 0)
+        if not self.width or not self.height:
+            raise ValueError("pas d'image dans cette vidéo")
+        num, _, den = str(st.get("avg_frame_rate") or "0/1").partition("/")
+        self.fps = float(num) / float(den or 1) if float(den or 1) else None
+        n = st.get("nb_frames")
+        dur = float(st.get("duration") or (info.get("format") or {}).get("duration") or 0)
+        self.count = int(n) if n and str(n).isdigit() else int(round(dur * (self.fps or 0)))
+        self.maxval = 255.0
+        self.bayer = None
+        quand = ((info.get("format") or {}).get("tags") or {}).get("creation_time")
+        try:
+            self.date = datetime.fromisoformat(quand.replace("Z", "+00:00")) if quand else None
+        except ValueError:
+            self.date = None
+        if self.date is None:                         # Dwarf 3 : DWARF3_TELE_2026-09-22-19-59-55-589.mp4
+            m = re.search(r"(\d{4})-(\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)", os.path.basename(path))
+            if m:
+                self.date = datetime(*map(int, m.groups())).astimezone()   # heure locale du téléphone
+        self.ffmpeg = ffmpeg
+
+    def frames(self, cancel=None):
+        """Générateur des images (float32, valeurs 0..maxval)."""
+        if self.ser is not None:
+            for i in range(self.count):
+                if cancel and cancel():
+                    return
+                a = self.ser.read_frame(i).astype(np.float32)
+                if self.bayer:
+                    a = debayer_superpixel(a, self.bayer)
+                yield a
+            return
+        taille = self.width * self.height * 3
+        p = subprocess.Popen([self.ffmpeg, "-v", "error", "-i", self.path, "-f", "rawvideo",
+                              "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, bufsize=taille * 2)
+        try:
+            while True:
+                if cancel and cancel():
+                    return
+                buf = p.stdout.read(taille)
+                if len(buf) < taille:
+                    return
+                yield np.frombuffer(buf, np.uint8).reshape(self.height, self.width, 3).astype(np.float32)
+        finally:
+            p.stdout.close()
+            p.kill()
+            p.wait()
+
+
+def luminance(a):
+    return a if a.ndim == 2 else a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+
+def lucky_measure(img):
+    """Netteté de l'image (énergie du laplacien sur l'astre, normalisée par sa luminosité),
+    centre de l'astre et sa boîte, en pixels de l'image entière. L'astre est repéré sur une image
+    réduite (rapide), la netteté mesurée en pleine résolution autour de lui seulement."""
+    g = luminance(img)
+    f = max(1, min(g.shape) // 270)                      # repérage sur ~270 px de haut
+    h, w = g.shape[0] // f * f, g.shape[1] // f * f
+    p = g[:h, :w].reshape(h // f, f, w // f, f).mean(axis=(1, 3)) if f > 1 else g
+    fond = float(np.percentile(p, 10))
+    haut = float(np.percentile(p, 99.7))
+    centre = (g.shape[1] / 2, g.shape[0] / 2)
+    if haut - fond < 1e-6:
+        return 0.0, *centre, None
+    masque = p > fond + 0.35 * (haut - fond)
+    if masque.sum() < 4:
+        return 0.0, *centre, None
+    ys, xs = np.nonzero(masque)
+    poids = p[ys, xs] - fond
+    cx = float((xs * poids).sum() / poids.sum() + 0.5) * f - 0.5
+    cy = float((ys * poids).sum() / poids.sum() + 0.5) * f - 0.5
+    x0, y0 = max(0, xs.min() * f - f), max(0, ys.min() * f - f)
+    x1, y1 = min(g.shape[1], (xs.max() + 2) * f), min(g.shape[0], (ys.max() + 2) * f)
+    boite = (x0, y0, x1, y1)
+    zone = g[y0:y1, x0:x1]
+    if min(zone.shape) < 5:
+        return 0.0, cx, cy, boite
+    s = box3(zone)
+    lap = 4 * s[1:-1, 1:-1] - s[:-2, 1:-1] - s[2:, 1:-1] - s[1:-1, :-2] - s[1:-1, 2:]
+    m = zone[1:-1, 1:-1] > fond + 0.35 * (haut - fond)
+    if m.sum() < 10:
+        return 0.0, cx, cy, boite
+    q = float((lap[m] ** 2).mean() / max(1e-9, float(zone[1:-1, 1:-1][m].mean() - fond) ** 2))
+    return q, cx, cy, boite
+
+
+def crop_at(img, x0, y0, size):
+    """Carré de côté size dont le coin est en (x0, y0), sous-pixel (bilinéaire) ; bords prolongés."""
+    ix, iy = int(np.floor(x0)), int(np.floor(y0))
+    fx, fy = x0 - ix, y0 - iy
+    h, w = img.shape[:2]
+    ys = np.clip(np.arange(iy, iy + size + 1), 0, h - 1)
+    xs = np.clip(np.arange(ix, ix + size + 1), 0, w - 1)
+    a = img[ys][:, xs]
+    return ((1 - fy) * ((1 - fx) * a[:-1, :-1] + fx * a[:-1, 1:])
+            + fy * ((1 - fx) * a[1:, :-1] + fx * a[1:, 1:])).astype(np.float32)
+
+
+def phase_shift(ref, img):
+    """Décalage (dx, dy) à appliquer à img pour la superposer à ref (corrélation de phase,
+    précision sous-pixel)."""
+    h, w = ref.shape
+    win = np.outer(np.hanning(h), np.hanning(w)).astype(np.float32)
+    a = np.fft.rfft2((ref - ref.mean()) * win)
+    b = np.fft.rfft2((img - img.mean()) * win)
+    r = a * np.conj(b)
+    r /= np.abs(r) + 1e-9
+    c = np.fft.irfft2(r, s=(h, w))
+    py, px = np.unravel_index(int(np.argmax(c)), c.shape)
+
+    def fin(c0, cm, cp):                              # sommet d'une parabole par 3 points
+        d = cm - 2 * c0 + cp
+        return 0.0 if abs(d) < 1e-12 else 0.5 * (cm - cp) / d
+    dy = py + fin(c[py, px], c[(py - 1) % h, px], c[(py + 1) % h, px])
+    dx = px + fin(c[py, px], c[py, (px - 1) % w], c[py, (px + 1) % w])
+    if dy > h / 2:
+        dy -= h
+    if dx > w / 2:
+        dx -= w
+    return float(dx), float(dy)
+
+
+def atrous(img, niveaux=5):
+    """Couches d'ondelettes « à trous » (B3-spline) : détails du plus fin au plus large, puis le reste."""
+    k = np.array([1, 4, 6, 4, 1], np.float32) / 16
+    couches, c = [], img.astype(np.float32)
+    for n in range(niveaux):
+        pas = 2 ** n
+        lisse = c
+        for axe in (0, 1):
+            p = [(0, 0)] * lisse.ndim
+            p[axe] = (2 * pas, 2 * pas)
+            e = np.pad(lisse, p, mode="reflect")
+            t = lisse.shape[axe]
+            lisse = sum(k[i] * np.take(e, np.arange(i * pas, i * pas + t), axis=axe) for i in range(5))
+        couches.append(c - lisse)
+        c = lisse
+    return couches, c
+
+
+def lucky_sharpen(img, force=1.0, maxval=1.0):
+    """Accentuation par ondelettes, comme dans Registax : renforce les détails fins, doucement les
+    moyens ; les grains de bruit les plus fins sont d'abord atténués."""
+    if force <= 0:
+        return img
+    couches, reste = atrous(img, 5)
+    gains = [1 + 0.6 * force, 1 + 1.6 * force, 1 + 0.9 * force, 1 + 0.3 * force, 1.0]
+    bruit = float(np.median(np.abs(couches[0]))) / 0.6745
+    c0 = couches[0]
+    couches[0] = np.sign(c0) * np.maximum(np.abs(c0) - 1.5 * bruit, 0)      # seuil doux : moins de grain
+    out = reste + sum(g * c for g, c in zip(gains, couches))
+    return np.clip(out, 0, maxval).astype(np.float32)
+
+
+def lucky_stack(path, garder=0.25, progress=None, cancel=None):
+    """Empile les meilleures images d'une vidéo. Renvoie un dict : pile (float32, 0..1), meilleure
+    image seule, nombres d'images, notes de netteté, date de la vidéo."""
+    src = VideoSource(path)
+    total = src.count or 0
+    # 1re lecture : netteté et position de l'astre dans chaque image
+    mesures, meilleure, note_max = [], None, -1.0
+    for i, img in enumerate(src.frames(cancel)):
+        mesures.append(lucky_measure(img))
+        if mesures[-1][0] > note_max:                 # la meilleure image servira de référence
+            note_max, meilleure = mesures[-1][0], img
+        if progress and i % 10 == 0:
+            progress(0.5 * i / max(1, total), f"Netteté des images : {i + 1} / {total or '?'}")
+    if cancel and cancel():
+        raise Cancelled()
+    n = len(mesures)
+    if n == 0:
+        raise ValueError("aucune image lue dans la vidéo")
+    notes = np.array([m[0] for m in mesures])
+    ordre = np.argsort(-notes)
+    n_garde = max(1, min(n, int(round(n * garder))))
+    gardees = set(int(i) for i in ordre[:n_garde])
+    # fenêtre autour de l'astre : d'après les boîtes des meilleures images
+    boites = [mesures[i][3] for i in ordre[:max(5, n_garde // 4)] if mesures[i][3]]
+    if boites:
+        tl = np.median([b[2] - b[0] for b in boites])
+        th = np.median([b[3] - b[1] for b in boites])
+        cote = int(max(tl, th) * 1.3) + 64
+    else:
+        cote = min(src.width, src.height)
+    cote = int(min(max(cote, 160), src.width, src.height)) // 2 * 2
+    ref_i = int(ordre[0])
+    _q, rcx, rcy, _b = mesures[ref_i]
+    ref = luminance(crop_at(meilleure, rcx - cote / 2, rcy - cote / 2, cote))
+    seule = crop_at(meilleure, rcx - cote / 2, rcy - cote / 2, cote)
+    del meilleure
+    # 2e lecture : chaque image gardée est recalée sur la meilleure, puis toutes sont moyennées
+    somme, poids = None, 0
+    for i, img in enumerate(src.frames(cancel)):
+        if progress and i % 10 == 0:
+            progress(0.5 + 0.5 * i / max(1, n), f"Alignement et empilement : {poids} / {n_garde}")
+        if i not in gardees:
+            continue
+        _q, cx, cy, _b = mesures[i]
+        x0, y0 = cx - cote / 2, cy - cote / 2
+        dx, dy = phase_shift(ref, luminance(crop_at(img, x0, y0, cote)))
+        morceau = crop_at(img, x0 - dx, y0 - dy, cote)
+        somme = morceau.astype(np.float64) if somme is None else somme + morceau
+        poids += 1
+    if cancel and cancel():
+        raise Cancelled()
+    pile = (somme / max(1, poids) / src.maxval).astype(np.float32)
+    seule = seule / src.maxval
+    if progress:
+        progress(1.0, "Terminé")
+    return {"pile": pile, "seule": seule.astype(np.float32), "n": n, "gardees": poids,
+            "notes": notes, "date": src.date, "fps": src.fps, "taille": (src.width, src.height)}
+
+
+def write_png16(path, img):
+    """PNG 16 bits (RVB ou gris) sans dépendance ; img en 0..1."""
+    import zlib
+    a = np.clip(np.asarray(img, np.float64), 0, 1)
+    a = (a * 65535 + 0.5).astype(">u2")
+    h, w = a.shape[:2]
+    couleur = 2 if a.ndim == 3 else 0
+    lignes = a.reshape(h, -1)
+    brut = b"".join(b"\x00" + lignes[y].tobytes() for y in range(h))
+
+    def bloc(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(bloc(b"IHDR", struct.pack(">IIBBBBB", w, h, 16, couleur, 0, 0, 0)))
+        f.write(bloc(b"IDAT", zlib.compress(brut, 6)))
+        f.write(bloc(b"IEND", b""))
+
+
+def write_stack_fits(path, img, res, source):
+    """Pile brute (non accentuée) en FITS 32 bits, pour Siril ou PixInsight."""
+    data = np.moveaxis(img, -1, 0) if img.ndim == 3 else img
+    h = fits.Header()
+    h["SOFTWARE"] = (APP_NAME, "Lucky imaging stack")
+    h["NCOMBINE"] = (int(res["gardees"]), "Frames stacked")
+    h["NFRAMES"] = (int(res["n"]), "Frames in the video")
+    h["SOURCE"] = to_ascii(os.path.basename(source))
+    if res.get("date"):
+        h["DATE-OBS"] = res["date"].astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    fits.PrimaryHDU(data.astype(np.float32), header=h).writeto(path, overwrite=False)
+
+
+# ----------------------------------------------------------------------------
 # Chargement en arrière-plan
 # ----------------------------------------------------------------------------
 
@@ -4641,6 +4937,262 @@ class PublishDialog(QDialog):
         return d
 
 
+# ----------------------------------------------------------------------------
+# Fenêtre « Empiler une vidéo »
+# ----------------------------------------------------------------------------
+
+class LuckyWorker(QThread):
+    progress = pyqtSignal(float, str)
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path, garder):
+        super().__init__()
+        self.path, self.garder, self.stop = path, garder, False
+
+    def run(self):
+        try:
+            res = lucky_stack(self.path, self.garder, progress=lambda f, m: self.progress.emit(f, m),
+                              cancel=lambda: self.stop)
+            self.done.emit(res)
+        except Cancelled:
+            self.failed.emit("")
+        except Exception as e:  # noqa: BLE001  affiché tel quel à l'utilisateur
+            self.failed.emit(str(e))
+
+
+class LuckyDialog(QDialog):
+    """Empiler une vidéo de la Lune, du Soleil ou d'une planète (MP4 du Dwarf 3, SER) :
+    tri des images par netteté, alignement, moyenne des meilleures, puis accentuation."""
+
+    def __init__(self, parent, path=""):
+        super().__init__(parent)
+        self.setWindowTitle("Empiler une vidéo (Lune, Soleil, planètes)")
+        self.resize(980, 720)
+        self.res, self.worker, self.saved = None, None, None
+        st = settings()
+        lay = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        self.path = QLineEdit(path)
+        self.path.setPlaceholderText("une vidéo MP4 du Dwarf 3, ou un SER")
+        self.path.editingFinished.connect(self.read_info)
+        pick = QPushButton("Choisir…")
+        pick.clicked.connect(self.pick)
+        row.addWidget(QLabel("Vidéo"))
+        row.addWidget(self.path, 1)
+        row.addWidget(pick)
+        lay.addLayout(row)
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        form = QFormLayout()
+        self.keep = QSpinBox()
+        self.keep.setRange(2, 90)
+        self.keep.setSuffix(" %")
+        self.keep.setValue(int(st.value("video/garder", 25) or 25))
+        self.keep.setToolTip("Part des images les plus nettes à empiler. Plus on en garde, moins il y a de "
+                             "bruit ; moins on en garde, plus on écarte les moments de turbulence.")
+        form.addRow("Images gardées", self.keep)
+        sl = QHBoxLayout()
+        self.sharp = QSlider(Qt.Orientation.Horizontal)
+        self.sharp.setRange(0, 30)
+        self.sharp.setValue(int(st.value("video/accentuation", 10) or 10))
+        self.sharp_txt = QLabel("")
+        self.sharp.valueChanged.connect(self.on_sharp)
+        sl.addWidget(self.sharp, 1)
+        sl.addWidget(self.sharp_txt)
+        form.addRow("Accentuation", sl)
+        lay.addLayout(form)
+
+        go = QHBoxLayout()
+        self.run_btn = QPushButton("Empiler")
+        self.run_btn.clicked.connect(self.start)
+        self.cancel_btn = QPushButton("Arrêter")
+        self.cancel_btn.clicked.connect(self.cancel)
+        self.cancel_btn.setEnabled(False)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.state = QLabel("")
+        go.addWidget(self.run_btn)
+        go.addWidget(self.cancel_btn)
+        go.addWidget(self.bar, 1)
+        lay.addLayout(go)
+        lay.addWidget(self.state)
+
+        vues = QHBoxLayout()
+        self.before, self.after = QLabel(), QLabel()
+        for titre, lab in (("Meilleure image seule", self.before), ("Empilement accentué", self.after)):
+            box = QVBoxLayout()
+            box.addWidget(QLabel(f"<b>{titre}</b>"))
+            lab.setMinimumSize(420, 420)
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lab.setStyleSheet("background:#05070c")
+            box.addWidget(lab, 1)
+            vues.addLayout(box, 1)
+        lay.addLayout(vues, 1)
+
+        btns = QHBoxLayout()
+        self.save_btn = QPushButton("Enregistrer…")
+        self.save_btn.clicked.connect(self.save)
+        self.pub_btn = QPushButton("Publier sur le site…")
+        self.pub_btn.clicked.connect(self.publish)
+        close = QPushButton("Fermer")
+        close.clicked.connect(self.reject)
+        for b in (self.save_btn, self.pub_btn):
+            b.setEnabled(False)
+            btns.addWidget(b)
+        btns.addStretch(1)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(250)
+        self.timer.timeout.connect(self.render)
+        self.on_sharp()
+        if path:
+            self.read_info()
+
+    # -- choix de la vidéo
+    def pick(self):
+        start = os.path.dirname(self.path.text()) or settings().value("video/dossier", "") or os.path.expanduser("~")
+        f, _ = QFileDialog.getOpenFileName(self, "Vidéo", start,
+                                           "Vidéos (*.mp4 *.MP4 *.mov *.m4v *.avi *.mkv *.ser *.SER)")
+        if f:
+            self.path.setText(f)
+            self.read_info()
+
+    def read_info(self):
+        p = self.path.text().strip()
+        if not p:
+            return
+        if not os.path.isfile(p):
+            self.info.setText("Fichier introuvable.")
+            return
+        if not is_ser(p) and not find_ffmpeg()[0]:
+            self.info.setText("Pour lire les MP4, installez ffmpeg : <code>sudo apt install ffmpeg</code>")
+            return
+        try:
+            v = VideoSource(p)
+        except Exception as e:  # noqa: BLE001
+            self.info.setText(f"Vidéo illisible : {e}")
+            return
+        dur = f", {v.count / v.fps:.0f} s à {v.fps:.0f} images/s" if v.fps else ""
+        quand = f" — filmée le {v.date.astimezone():%d/%m/%Y à %H:%M}" if v.date else ""
+        self.info.setText(f"{v.width} × {v.height} pixels, {v.count} images{dur}{quand}.")
+
+    # -- calcul
+    def start(self):
+        p = self.path.text().strip()
+        if not os.path.isfile(p):
+            QMessageBox.warning(self, APP_NAME, "Choisissez d'abord une vidéo.")
+            return
+        st = settings()
+        st.setValue("video/garder", self.keep.value())
+        st.setValue("video/dossier", os.path.dirname(p))
+        self.res, self.saved = None, None
+        self.worker = LuckyWorker(p, self.keep.value() / 100)
+        self.worker.progress.connect(lambda f, m: (self.bar.setValue(int(f * 1000)), self.state.setText(m)))
+        self.worker.done.connect(self.finished)
+        self.worker.failed.connect(self.failed)
+        self.run_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        for b in (self.save_btn, self.pub_btn):
+            b.setEnabled(False)
+        self.worker.start()
+
+    def cancel(self):
+        if self.worker:
+            self.worker.stop = True
+
+    def failed(self, msg):
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.bar.setValue(0)
+        self.state.setText("Arrêté." if not msg else "")
+        if msg:
+            QMessageBox.warning(self, APP_NAME, f"L'empilement a échoué :\n{msg}")
+
+    def finished(self, res):
+        self.res = res
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        for b in (self.save_btn, self.pub_btn):
+            b.setEnabled(True)
+        n = res["notes"]
+        ecart = 100 * (n.max() - np.median(n)) / max(1e-12, np.median(n))
+        self.state.setText(f"{res['gardees']} images empilées sur {res['n']}. La meilleure est {ecart:.0f} % plus "
+                           f"nette que la moyenne" + (" : turbulence faible, gardez-en beaucoup pour moins de bruit."
+                                                       if ecart < 15 else "."))
+        self.show_image(self.before, res["seule"])
+        self.render()
+
+    # -- accentuation et aperçu
+    def on_sharp(self):
+        self.sharp_txt.setText(f"{self.sharp.value() / 10:.1f}")
+        settings().setValue("video/accentuation", self.sharp.value())
+        self.saved = None
+        if self.res is not None:
+            self.timer.start()
+
+    def sharpened(self):
+        return lucky_sharpen(self.res["pile"], self.sharp.value() / 10)
+
+    def render(self):
+        if self.res is not None:
+            self.show_image(self.after, self.sharpened())
+
+    def show_image(self, lab, img):
+        a = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+        if a.ndim == 3 and a.shape[2] == 1:
+            a = a[..., 0]
+        pm = QPixmap.fromImage(numpy_to_qimage(np.ascontiguousarray(a)))
+        lab.setPixmap(pm.scaled(lab.width(), lab.height(), Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation))
+
+    # -- enregistrer, publier
+    def save(self, ask=True):
+        """Écrit la pile brute (FITS 32 bits, pour Siril ou PixInsight) et la pile accentuée (PNG 16 bits).
+        Rien n'est écrasé ; la vidéo n'est pas modifiée."""
+        src = self.path.text().strip()
+        folder = os.path.dirname(src)
+        if ask:
+            folder = QFileDialog.getExistingDirectory(self, "Dossier où enregistrer", folder)
+            if not folder:
+                return None
+        stem = split_ext(os.path.basename(src))[0]
+        try:
+            fits_path = unique_path(os.path.join(folder, f"{stem}_pile.fits"))
+            write_stack_fits(fits_path, self.res["pile"], self.res, src)
+            png_path = unique_path(os.path.join(folder, f"{stem}_pile_accentuee.png"))
+            write_png16(png_path, self.sharpened())
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"Enregistrement impossible :\n{e}")
+            return None
+        self.saved = png_path
+        if ask:
+            QMessageBox.information(self, APP_NAME, "Enregistré :\n"
+                                    f"• {os.path.basename(png_path)} : l'empilement accentué (PNG 16 bits), "
+                                    "prêt à publier ou à retoucher ;\n"
+                                    f"• {os.path.basename(fits_path)} : l'empilement brut (FITS 32 bits), pour "
+                                    "des ondelettes plus fines dans Siril ou PixInsight.")
+        return png_path
+
+    def publish(self):
+        png = self.saved
+        if not png:                                   # pas encore enregistrée : une copie dans le cache suffit
+            dossier = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                                   APP_ID, "publier")
+            os.makedirs(dossier, exist_ok=True)
+            stem = split_ext(os.path.basename(self.path.text().strip()))[0]
+            png = os.path.join(dossier, f"{stem}_pile_accentuee.png")
+            write_png16(png, self.sharpened())
+        quand = self.res.get("date")
+        self.parent().publish_dialog(image=png, solve=False, prise_le=quand)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4901,6 +5453,9 @@ class MainWindow(QMainWindow):
         self._action(m, "Lancer un script Siril…", self.run_siril_dialog)
         self._action(m, "Composer en bande étroite (Ha, OIII, HOO, SHO)…",
                      self.compose_dialog)
+        m.addSeparator()
+        self._action(m, "Empiler une vidéo (Lune, Soleil, planètes)…",
+                     self.lucky_dialog, "Ctrl+Shift+V")
 
         m = mb.addMenu("&Affichage")
         m.addAction(self.play_action)
@@ -7401,16 +7956,24 @@ class MainWindow(QMainWindow):
         return path
 
     # -- publication sur le site
-    def publish_dialog(self):
+    def publish_dialog(self, image=None, solve=None, prise_le=None):
         rows = self.journal_rows()
         current = journal_entries(rows)
         targets = [r["object"] for r in rows if r.get("object")]
         target = max(set(targets), key=targets.count) if targets else ""
+        if image:                                     # empilement d'une vidéo : pas la cible des brutes
+            target = ""
         dlg = PublishDialog(self, target, read_journal() + current, bool(self.find_solver()))
+        if image:
+            dlg.image.setText(image)
+        if solve is not None:
+            dlg.solve.setChecked(solve)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         base, tok = dlg.site()
         data = dlg.payload()
+        if prise_le and "version_de" not in data:      # heure de la vidéo : terminateur juste pour les noms lunaires
+            data["prise_le"] = prise_le.astimezone(timezone.utc).isoformat(timespec="seconds")
         msg = self.publish(base, tok, dlg.image.text().strip(), data,
                            dlg.solve.isChecked(), dlg.catalogue, dlg.fov.value() or None,
                            dlg.solve_image.text().strip() or None,
@@ -8321,9 +8884,24 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        videos = [p for p in paths if is_video(p)]
+        if videos:                                    # MP4 du Dwarf 3 : directement à l'empilement
+            e.acceptProposedAction()
+            self.lucky_dialog(videos[0])
+            paths = [p for p in paths if not is_video(p)]
         if paths:
             self.add_paths(paths)
             e.acceptProposedAction()
+
+    def lucky_dialog(self, path=""):
+        """Empiler une vidéo de la Lune, du Soleil ou d'une planète. Un SER sélectionné dans la liste
+        est proposé d'office."""
+        if not path:
+            it = self.list.currentItem()
+            src = it.data(0, ROLE_SRC) if it else None
+            if src and is_ser(src[0]):
+                path = src[0]
+        LuckyDialog(self, path).exec()
 
     def closeEvent(self, e):
         self.play_timer.stop()
