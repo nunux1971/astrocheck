@@ -39,6 +39,7 @@ Raccourcis principaux
   Z           afficher la zone utile sur l'image
   Ctrl+Maj+R  choisir l'image affichée comme référence
   Ctrl+Maj+Début  première image comme référence (comme le Dwarf 3)
+  Ctrl+Maj+D  empiler les brutes gardées avec drizzle (×1 à ×3)
   Ctrl+Maj+S  exporter vers PixInsight ou Siril
 
 Pour désinstaller AstroCheck : sh installer_astrocheck.sh --retirer

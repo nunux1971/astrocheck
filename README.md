@@ -20,6 +20,7 @@ Pensé pour l'ASIAIR et le **Dwarf 3**, il fonctionne avec tout logiciel d'acqui
 - **Contrôle des darks et des flats** : pose, gain, température, lumière parasite, saturation, motif.
 - **Bilan de la séance** : coût du tri en signal/bruit, comparaison des nuits, dérive de la mise au point avec la température, traînées de satellites.
 - **Aperçu d'empilement rapide** : les brutes gardées alignées et empilées en quelques secondes, comparées à une image seule et à l'empilement avec les rejetées, avec **résolution astrométrique** (ASTAP ou Siril) et grille RA/DEC.
+- **Empilement complet avec drizzle** : toutes les brutes gardées, en pleine résolution, sur une grille ×1 à ×3 ; drizzle bayer (sans débayérisation) pour les capteurs couleur, rejet des traînées et des pixels chauds, pondération par le bruit, calibration par les darks, flats et offsets de la liste, puis FITS 32 bits pour Siril ou PixInsight.
 - **Journal pour AstroPlan**, envoyé automatiquement sur le serveur si vous le souhaitez.
 - **Séries** : caméras TELE et WIDE du Dwarf 3, filtres, poses et gains traités séparément.
 - **Empilement des vidéos de la Lune, du Soleil et des planètes** (MP4 du Dwarf 3, SER) : tri des images par netteté, alignement au sous-pixel, moyenne des meilleures, accentuation par ondelettes réglable, puis publication sur le site en un clic.
@@ -58,7 +59,7 @@ python3 astrocheck.py ~/Astro/NGC7380
 2. **Ctrl+R** : analyser et classer. Les images écartées apparaissent en orange.
 3. Parcourez-les avec ↑ ↓, **Espace** pour garder ou rejeter.
 4. **Ctrl+B** : bilan de la séance, **Ctrl+U** : rotation et zone utile.
-5. **Ctrl+Maj+S** : exporter vers PixInsight ou Siril.
+5. **Ctrl+Maj+D** : empiler les brutes avec drizzle, ou **Ctrl+Maj+S** : exporter vers PixInsight ou Siril.
 6. **Ctrl+Maj+V**, ou glisser un MP4 sur la fenêtre : empiler une vidéo de la Lune, du Soleil ou d'une planète.
 
 La notice complète est dans [NOTICE.md](NOTICE.md).

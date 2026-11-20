@@ -18,6 +18,8 @@ AstroCheck — contrôle et tri des nuits d'astrophotographie
   courbure de champ)
 - Reconnaissance des darks, flats et offsets, vérification de leur cohérence
   avec les brutes, export en structure Siril avec script de prétraitement
+- Empilement complet des brutes gardées avec drizzle (bayer ou mono),
+  rejet des pixels aberrants et calibration par les darks et flats
 - Rangement des fichiers rejetés dans « rejetes » (ou suppression)
 - Export des images choisies en vidéo SER, ou vers un dossier de
   traitement pour Siril ou PixInsight (copies ou liens)
@@ -2822,6 +2824,511 @@ def quick_stack(items, ref, progress=None):
 
 
 # ----------------------------------------------------------------------------
+# Empilement complet en pleine résolution, avec drizzle
+# ----------------------------------------------------------------------------
+#
+# Chaque pixel d'une brute est une « goutte » carrée (taille pixfrac) posée,
+# après alignement sur la référence, sur une grille de sortie plus fine
+# (échelle s). Sa valeur est répartie sur les pixels de sortie qu'elle
+# recouvre, au prorata de la surface. Avec une matrice de Bayer, chaque
+# pixel ne nourrit que sa propre couleur (drizzle bayer) : pas de
+# débayérisation, donc pas d'interpolation des couleurs.
+# Les rotations restent petites d'une image à l'autre : la goutte tournée est
+# remplacée par un carré droit de même surface (noyau « turbo » de Drizzle).
+
+DZ_SCALES = (1.0, 1.5, 2.0, 3.0)
+DZ_TILE = 384           # côté des tuiles d'entrée traitées d'un coup (pixels)
+DZ_MIN_REJECT = 5       # rejet des pixels aberrants à partir de 5 brutes
+
+
+def cfa_channels(pattern):
+    """Canal (0 R, 1 V, 2 B) de chaque position de la matrice 2 × 2."""
+    idx = {"R": 0, "G": 1, "B": 2}
+    return np.array([[idx[pattern[0]], idx[pattern[1]]],
+                     [idx[pattern[2]], idx[pattern[3]]]], dtype=np.int64)
+
+
+def cfa_map(chan, shape):
+    """Carte du canal de chaque pixel d'une image bayer."""
+    h, w = shape
+    return np.tile(chan, ((h + 1) // 2, (w + 1) // 2))[:h, :w]
+
+
+def master_frame(srcs, shape, sub=None, tick=None, kappa=3.0):
+    """Image maîtresse de calibration : moyenne avec rejet des pixels aberrants
+    (deux lectures, sans garder toutes les images en mémoire). sub : image
+    retirée à chacune (offset, dark de flat). Les images d'une autre taille
+    sont ignorées. Renvoie (image float32 ou None, nombre d'images)."""
+    s1 = np.zeros(shape, np.float64)
+    s2 = np.zeros(shape, np.float64)
+    good = []
+    for src in srcs:
+        if tick:
+            tick(src)
+        d = read_source(src)[0]
+        if d.shape != tuple(shape):
+            continue
+        d = d.astype(np.float64)
+        if sub is not None:
+            d -= sub
+        s1 += d
+        s2 += d * d
+        good.append(src)
+    n = len(good)
+    if not n:
+        return None, 0
+    mean = s1 / n
+    if n < DZ_MIN_REJECT:
+        return mean.astype(np.float32), n
+    sig = np.sqrt(np.maximum(s2 / n - mean * mean, 0.0))
+    del s1, s2
+    acc = np.zeros(shape, np.float64)
+    cnt = np.zeros(shape, np.float32)
+    for src in good:
+        if tick:
+            tick(src)
+        d = read_source(src)[0].astype(np.float64)
+        if sub is not None:
+            d -= sub
+        ok = np.abs(d - mean) <= kappa * sig + 1e-6
+        acc += np.where(ok, d, 0.0)
+        cnt += ok
+    out = np.where(cnt > 0, acc / np.maximum(cnt, 1), mean)
+    return out.astype(np.float32), n
+
+
+def calibration_reads(groups, light_exp):
+    """Nombre de lectures de fichiers que demandera build_calibration."""
+    def reads(n):
+        return 2 * n if n >= DZ_MIN_REJECT else n
+    darks = dz_matching_darks(groups.get("dark", []), light_exp)
+    return sum(reads(len(groups.get(k, []))) for k in ("bias", "darkflat", "flat")) \
+        + reads(len(darks))
+
+
+def dz_matching_darks(darks, light_exp, tol=0.10):
+    """Darks de même pose que les brutes (à 10 % près ; pose inconnue : gardés).
+    darks : [(source, pose ou None)]."""
+    if not light_exp:
+        return list(darks)
+    return [(s, e) for s, e in darks
+            if not e or abs(e - light_exp) <= tol * light_exp]
+
+
+def build_calibration(groups, shape, bayer, light_exp, tick=None):
+    """Masters de calibration à partir des fichiers de la liste.
+    groups : {"dark"|"flat"|"bias"|"darkflat": [(source, pose)]}.
+    Renvoie {"dark": image à retirer ou None, "flat": flat normalisé ou None,
+    "notes": [phrases]}."""
+    notes = []
+    srcs = lambda key: [s for s, _e in groups.get(key, [])]
+    bias, nb = master_frame(srcs("bias"), shape, tick=tick) if groups.get("bias") else (None, 0)
+    if nb:
+        notes.append(f"offset maître : {nb} offset(s)")
+    darks = dz_matching_darks(groups.get("dark", []), light_exp)
+    dark, nd = (master_frame([s for s, _e in darks], shape, tick=tick)
+                if darks else (None, 0))
+    if nd:
+        notes.append(f"dark maître : {nd} dark(s)")
+    elif groups.get("dark"):
+        notes.append("darks ignorés : pose différente de celle des brutes"
+                     + (", offset retiré à la place" if bias is not None else ""))
+    flat = None
+    if groups.get("flat"):
+        sub, ndf = (master_frame(srcs("darkflat"), shape, tick=tick)
+                    if groups.get("darkflat") else (None, 0))
+        if ndf:
+            notes.append(f"dark de flat maître : {ndf} image(s)")
+        elif bias is not None:
+            sub = bias
+        flat, nf = master_frame(srcs("flat"), shape, sub=sub, tick=tick)
+        if flat is not None:
+            # normalisation par canal de la matrice : les couleurs des brutes
+            # ne changent pas, seul le vignetage et les poussières sont corrigés
+            if bayer in BAYER_PATTERNS:
+                for dy in (0, 1):
+                    for dx in (0, 1):
+                        q = flat[dy::2, dx::2]
+                        med = float(np.median(subsample(q)))
+                        q /= med if med > 0 else 1.0
+            else:
+                med = float(np.median(subsample(flat)))
+                flat /= med if med > 0 else 1.0
+            np.clip(flat, 0.05, None, out=flat)
+            notes.append(f"flat maître : {nf} flat(s)")
+        else:
+            notes.append("flats ignorés : taille différente de celle des brutes")
+    return {"dark": dark if dark is not None else bias, "flat": flat, "notes": notes}
+
+
+def calibrate(data, calib):
+    """Retire le dark (ou l'offset) et divise par le flat, si de même taille."""
+    if not calib or data.ndim != 2:
+        return data
+    d = calib.get("dark")
+    if d is not None and d.shape == data.shape:
+        data = data - d
+    f = calib.get("flat")
+    if f is not None and f.shape == data.shape:
+        data = data / f
+    return data
+
+
+def drizzle_frame(img, chan, tr, s, pixfrac, acc, wacc, acc2=None, ref=None,
+                  fw=1.0, pitch=1, kappa=3.0, poll=None):
+    """Dépose une brute sur la grille de sortie.
+
+    img : H×W (mono ou bayer) ou H×W×C, fond déjà retiré ;
+    chan : carte H×W des canaux d'une image bayer, ou None ;
+    tr : p_ref = R(angle) · p_img + (dx, dy) en pixels des fichiers (None : référence) ;
+    s : échelle de sortie ; pixfrac : côté de la goutte (fraction du pixel) ;
+    acc, wacc : sommes Σ w·v et Σ w (Ho×Wo×C, float32) ; acc2 : Σ w·v² (1re passe) ;
+    ref : (moyenne, écart-type) de la 1re passe, pour rejeter les valeurs aberrantes ;
+    fw : poids de l'image ; pitch : taille d'un pixel de img en pixels du fichier
+    (2 après une débayérisation super-pixel).
+    Renvoie le nombre de valeurs rejetées."""
+    Ho, Wo, C = acc.shape
+    H, W = img.shape[:2]
+    cin = img.shape[2] if img.ndim == 3 else 1
+    if tr:
+        a = np.radians(tr["angle"])
+        ca, sa, dx, dy = np.cos(a), np.sin(a), tr["dx"], tr["dy"]
+    else:
+        ca, sa, dx, dy = 1.0, 0.0, 0.0, 0.0
+    half = 0.5 * pixfrac * s * pitch
+    K = int(np.ceil(2.0 * half)) + 1
+    off = (pitch - 1) / 2.0
+
+    def tile(r0, c0):
+        r1, c1 = min(H, r0 + DZ_TILE), min(W, c0 + DZ_TILE)
+        nrej = 0
+        yy, xx = np.mgrid[r0:r1, c0:c1]
+        fx, fy = xx * float(pitch) + off, yy * float(pitch) + off
+        u = ((fx * ca - fy * sa + dx) + 0.5) * s
+        v = ((fx * sa + fy * ca + dy) + 0.5) * s
+        if (u.max() + half < 0 or u.min() - half > Wo
+                or v.max() + half < 0 or v.min() - half > Ho):
+            return None
+        u, v = u.ravel(), v.ravel()
+        vals = img[r0:r1, c0:c1].reshape(-1, cin).astype(np.float32)   # copie
+        if chan is not None:
+            chs = chan[r0:r1, c0:c1].ravel()
+            plane = [chs]                       # un canal par pixel
+        else:
+            plane = [np.full(u.shape, c, np.int64) for c in range(cin)]
+        if ref is not None:                    # 2e passe : rejet
+            iu = np.floor(u).astype(np.int64)
+            iv = np.floor(v).astype(np.int64)
+            ins = (iu >= 0) & (iu < Wo) & (iv >= 0) & (iv < Ho)
+            iu, iv = np.clip(iu, 0, Wo - 1), np.clip(iv, 0, Ho - 1)
+            for k, ch in enumerate(plane):
+                cs = ch if ref[0].shape[2] > 1 else 0
+                m, sd = ref[0][iv, iu, cs], ref[1][iv, iu, cs]
+                with np.errstate(invalid="ignore"):
+                    bad = ins & (np.abs(vals[:, k] - m) > kappa * sd)
+                nrej += int(np.count_nonzero(bad))
+                vals[bad, k] = np.nan
+        x0, y0 = u - half, v - half
+        ix0 = np.floor(x0).astype(np.int64)
+        iy0 = np.floor(y0).astype(np.int64)
+        bx0, bx1 = max(0, int(ix0.min())), min(Wo, int(ix0.max()) + K)
+        by0, by1 = max(0, int(iy0.min())), min(Ho, int(iy0.max()) + K)
+        if bx1 <= bx0 or by1 <= by0:
+            return None
+        bw, bh = bx1 - bx0, by1 - by0
+        size = bh * bw * C
+        # recouvrement de la goutte avec chaque colonne et chaque ligne
+        # touchées ; hors de la zone de sortie : poids nul
+        cols_, rows_ = [], []
+        for k in range(K):
+            ix = ix0 + k
+            ox = np.minimum(x0 + 2 * half, ix + 1) - np.maximum(x0, ix)
+            ox[(ox < 0) | (ix < bx0) | (ix >= bx1)] = 0.0
+            cols_.append((np.clip(ix - bx0, 0, bw - 1), ox))
+            iy = iy0 + k
+            oy = np.minimum(y0 + 2 * half, iy + 1) - np.maximum(y0, iy)
+            oy[(oy < 0) | (iy < by0) | (iy >= by1)] = 0.0
+            rows_.append((np.clip(iy - by0, 0, bh - 1) * bw, oy * fw))
+        cx = np.stack([c for c, _w in cols_])                    # K × P
+        wx = np.stack([w for _c, w in cols_])
+        ry = np.stack([r for r, _w in rows_])
+        wy = np.stack([w for _r, w in rows_])
+        loc = (ry[:, None, :] + cx[None, :, :]).reshape(-1, len(u)) * C   # K² × P
+        wgt = (wy[:, None, :] * wx[None, :, :]).reshape(-1, len(u))
+        la = lw = l2 = None
+        for k, ch in enumerate(plane):
+            vv = vals[:, k]
+            good = np.isfinite(vv)
+            vv = np.where(good, vv, 0.0)
+            idx = (loc + ch[None, :]).ravel()
+            w = (wgt * good[None, :]).ravel()
+            wv = w * np.broadcast_to(vv[None, :], wgt.shape).ravel()
+            b_w = np.bincount(idx, w, minlength=size)
+            b_a = np.bincount(idx, wv, minlength=size)
+            la = b_a if la is None else la + b_a
+            lw = b_w if lw is None else lw + b_w
+            if acc2 is not None:
+                b_2 = np.bincount(idx, wv * np.broadcast_to(vv[None, :], wgt.shape).ravel(),
+                                  minlength=size)
+                l2 = b_2 if l2 is None else l2 + b_2
+        return by0, bx0, bh, bw, la, lw, l2, nrej
+
+    tiles = [(r0, c0) for r0 in range(0, H, DZ_TILE) for c0 in range(0, W, DZ_TILE)]
+    rejected = 0
+
+    def add(res):
+        nonlocal rejected
+        if res is None:
+            return
+        by0, bx0, bh, bw, la, lw, l2, nrej = res
+        rejected += nrej
+        if la is None:
+            return
+        sl = (slice(by0, by0 + bh), slice(bx0, bx0 + bw))
+        acc[sl] += la.reshape(bh, bw, C).astype(np.float32)
+        wacc[sl] += lw.reshape(bh, bw, C).astype(np.float32)
+        if acc2 is not None:
+            acc2[sl] += l2.reshape(bh, bw, C).astype(np.float32)
+
+    # tuiles calculées en parallèle (numpy libère le verrou de Python),
+    # additionnées dans l'ordre par ce fil, quelques-unes en attente au plus
+    workers = dz_workers()
+    if workers <= 1:
+        for t in tiles:
+            add(tile(*t))
+            if poll:
+                poll()
+        return rejected
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pending = []
+        for t in tiles:
+            pending.append(ex.submit(tile, *t))
+            if len(pending) >= 2 * workers:
+                add(pending.pop(0).result())
+                if poll:
+                    poll()
+        for f in pending:
+            add(f.result())
+            if poll:
+                poll()
+    return rejected
+
+
+def dz_workers():
+    """Fils de calcul du drizzle : les cœurs du processeur, 8 au plus."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    return max(1, min(8, n))
+
+
+def fill_holes(img, have, passes=8):
+    """Comble les pixels sans donnée (have faux) par la moyenne de leurs voisins
+    qui en ont, de proche en proche. img, have : 2D. Renvoie le nombre comblé."""
+    filled = 0
+    have = have.copy()
+    for _ in range(passes):
+        if have.all():
+            break
+        m = have.astype(np.float32)
+        num, den = box3(np.where(have, img, 0.0).astype(np.float32)), box3(m)
+        new = (~have) & (den > 0)
+        if not new.any():
+            break
+        img[new] = num[new] / den[new]
+        have |= new
+        filled += int(np.count_nonzero(new))
+    return filled
+
+
+def channel_levels(img, chan):
+    """Niveau du fond (médiane) de chaque canal : 3 pour une image bayer ou
+    couleur, 1 pour une image mono."""
+    if chan is not None:
+        out = np.zeros(3, np.float32)
+        for c in range(3):
+            q = [img[dy::2, dx::2] for dy in (0, 1) for dx in (0, 1)
+                 if chan[dy, dx] == c]
+            out[c] = float(np.median(np.concatenate([subsample(x).ravel() for x in q])))
+        return out
+    if img.ndim == 3:
+        return np.array([float(np.median(subsample(img[..., c])))
+                         for c in range(img.shape[2])], np.float32)
+    return np.array([float(np.median(subsample(img)))], np.float32)
+
+
+def remove_levels(img, chan, lev):
+    if chan is not None:
+        return img - lev[chan]
+    return img - (lev if img.ndim == 3 else lev[0])
+
+
+def dz_noise(img, bayer):
+    """Bruit de fond d'une brute (sur l'image super-pixel si bayer)."""
+    if img.ndim == 2 and bayer in BAYER_PATTERNS:
+        img = debayer_superpixel(img, bayer)
+    return qs_noise(img)
+
+
+def dz_memory(shape, color, scale, reject):
+    """Mémoire approximative (octets) d'un empilement drizzle."""
+    h, w = shape
+    n = int(round(h * scale)) * int(round(w * scale)) * (3 if color else 1) * 4
+    return n * ((3 if reject else 2) + 2) + 600_000_000
+
+
+def available_memory():
+    """Mémoire disponible (octets) sous Linux, sinon None."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def drizzle_stack(items, ref, opts, calib=None, tick=None, poll=None):
+    """Empilement pleine résolution avec drizzle.
+    items : [(source, transformation)] ; ref : source de référence (grille de
+    sortie) ; opts : {"scale", "pixfrac", "superpixel", "reject", "kappa",
+    "weight"} ; calib : résultat de build_calibration ou None ;
+    tick(src) avant chaque lecture de fichier, poll() pendant les calculs.
+    Renvoie un dict compatible avec la fenêtre d'aperçu d'empilement."""
+    if not items:
+        raise ValueError("aucune image à empiler")
+    s, pixfrac = float(opts.get("scale", 2.0)), float(opts.get("pixfrac", 1.0))
+    kappa = float(opts.get("kappa", 3.0))
+    reject = bool(opts.get("reject", True)) and len(items) >= DZ_MIN_REJECT
+    rdata, rheader, _ = read_source(ref)
+    H, W = rdata.shape[:2]
+    bayer = str(rheader.get("BAYERPAT", "") or "").strip().upper()
+    is_cfa = rdata.ndim == 2 and bayer in BAYER_PATTERNS
+    superpixel = is_cfa and bool(opts.get("superpixel"))
+    C = 3 if (is_cfa or rdata.ndim == 3) else 1
+    Ho, Wo = int(round(H * s)), int(round(W * s))
+    chan_full = cfa_map(cfa_channels(bayer), (H, W)) if is_cfa else None
+
+    def prepare(data, header):
+        """Brute calibrée, sans fond, et ses paramètres de dépôt."""
+        if data.shape[:2] != (H, W) or (data.ndim == 3) != (rdata.ndim == 3):
+            raise ValueError("taille ou couleur différente de la référence")
+        data = calibrate(data.astype(np.float32), calib)
+        noise = dz_noise(data, bayer if is_cfa else "")
+        if superpixel:
+            img, chan, pitch = debayer_superpixel(data, bayer), None, 2
+        else:
+            img, chan, pitch = data, chan_full, 1
+        lev = channel_levels(img, chan)
+        return remove_levels(img, chan, lev).astype(np.float32), chan, pitch, lev, noise
+
+    _i, _c, _p, ref_lev, ref_noise = prepare(rdata, rheader)
+    del _i
+    acc = np.zeros((Ho, Wo, C), np.float32)
+    wacc = np.zeros((Ho, Wo, C), np.float32)
+    acc2 = np.zeros((Ho, Wo, C), np.float32) if reject else None
+    noises, rejected, samples = {}, 0, 0
+
+    def one_pass(acc2=None, stats=None):
+        nonlocal rejected, samples
+        for src, tr in items:
+            if tick:
+                tick(src)
+            data, header, _ = read_source(src)
+            try:
+                img, chan, pitch, _lev, noise = prepare(data, header)
+            except ValueError as e:
+                raise ValueError(f"{src_name(src)} : {e}") from None
+            del data
+            noises[src] = noise
+            fw = 1.0
+            if opts.get("weight", True) and noise and ref_noise:
+                fw = float(np.clip((ref_noise / noise) ** 2, 0.05, 20.0))
+            r = drizzle_frame(img, chan, None if src == ref else tr, s, pixfrac,
+                              acc, wacc, acc2=acc2, ref=stats, fw=fw, pitch=pitch,
+                              kappa=kappa, poll=poll)
+            if stats is not None:
+                rejected += r
+                samples += img.size
+
+    one_pass(acc2=acc2)
+    if reject:
+        # moyenne et écart-type pondérés de chaque pixel de sortie. En bayer,
+        # les trois couleurs sont réunies : un pixel rouge ou bleu ne reçoit
+        # qu'environ une brute sur quatre, trop peu pour juger seul ; réunies,
+        # toutes les brutes comptent, et un simple écart de couleur ne peut
+        # dépasser √3 écarts-types, en deçà du seuil de rejet.
+        if chan_full is not None and not superpixel:
+            acc, acc2, wacc = (a_.sum(axis=2, keepdims=True) for a_ in (acc, acc2, wacc))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = acc / wacc
+            acc2 /= wacc                                  # Σw·v² / Σw
+            np.multiply(mean, mean, out=acc)              # acc ← moyenne²
+            acc2 -= acc
+            np.maximum(acc2, 0.0, out=acc2)
+            sigma = np.sqrt(acc2, out=acc2)
+        sigma[~np.isfinite(mean)] = np.nan
+        acc = np.zeros((Ho, Wo, C), np.float32)
+        wacc = np.zeros((Ho, Wo, C), np.float32)
+        one_pass(stats=(mean, sigma))
+        del mean, sigma
+    if poll:
+        poll()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = acc / wacc
+    del acc
+    have = wacc > 0
+    # zone couverte par la plupart des brutes
+    total = wacc.sum(axis=2)
+    pos = total[total > 0]
+    thr = 0.5 * float(np.percentile(pos, 90)) if pos.size else 0.0
+    full = total >= max(thr, 1e-12)
+    rows, cols = np.nonzero(full.any(axis=1))[0], np.nonzero(full.any(axis=0))[0]
+    crop = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1)) \
+        if len(rows) and len(cols) else (slice(None), slice(None))
+    out, have, full = out[crop], have[crop], full[crop]
+    holes = 0
+    for c in range(C):
+        holes = max(holes, int(np.count_nonzero(full & ~have[..., c])))
+        plane = np.nan_to_num(out[..., c])
+        fill_holes(plane, have[..., c] | ~full)
+        out[..., c] = plane + ref_lev[c]
+    out[~full] = 0.0
+    out = np.ascontiguousarray(out, dtype=np.float32)
+    # la référence seule, agrandie au pixel près sur la même grille, pour comparer
+    rimg = calibrate(rdata.astype(np.float32), calib)
+    if is_cfa:
+        rimg, rp = debayer_superpixel(rimg, bayer), 2
+    else:
+        rp = 1
+    if rimg.ndim == 2:
+        rimg = rimg[..., None]
+    roff = (rp - 1) / 2.0
+    ys = np.arange(Ho)[crop[0]]
+    xs = np.arange(Wo)[crop[1]]
+    yi = np.clip(np.round(((ys + 0.5) / s - 0.5 - roff) / rp), 0, rimg.shape[0] - 1).astype(np.int64)
+    xi = np.clip(np.round(((xs + 0.5) / s - 0.5 - roff) / rp), 0, rimg.shape[1] - 1).astype(np.int64)
+    single = np.ascontiguousarray(rimg[yi][:, xi], dtype=np.float32)
+    n = len(items)
+    ns = [noises.get(src) for src, _t in items]
+    return {"stack": out, "single": single, "n": n, "scale": 1.0 / s,
+            "drizzle": {"scale": s, "pixfrac": pixfrac, "superpixel": superpixel,
+                        "cfa": is_cfa, "reject": reject, "kappa": kappa,
+                        "weight": bool(opts.get("weight", True)),
+                        "holes": holes / float(max(1, np.count_nonzero(full))),
+                        "noise_spread": (min(x for x in ns if x) / max(x for x in ns if x))
+                        if any(ns) else None},
+            "noise_single": None, "noise_stack": None, "gain": None,
+            "rejected": rejected / float(samples) if samples else 0.0,
+            "exposure": None, "header": rheader,
+            "origin": (int(ys[0]) if len(ys) else 0, int(xs[0]) if len(xs) else 0),
+            "calib_notes": (calib or {}).get("notes", [])}
+
+
+# ----------------------------------------------------------------------------
 # Résolution astrométrique de l'aperçu (ASTAP ou Siril, installés à part)
 # ----------------------------------------------------------------------------
 
@@ -5454,6 +5961,8 @@ class MainWindow(QMainWindow):
         self._action(m, "Composer en bande étroite (Ha, OIII, HOO, SHO)…",
                      self.compose_dialog)
         m.addSeparator()
+        self._action(m, "Empiler les brutes avec drizzle…",
+                     self.drizzle_dialog, "Ctrl+Shift+D")
         self._action(m, "Empiler une vidéo (Lune, Soleil, planètes)…",
                      self.lucky_dialog, "Ctrl+Shift+V")
 
@@ -8390,14 +8899,16 @@ class MainWindow(QMainWindow):
                 + ("activé" if edit.text().strip() else "désactivé"), 6000)
 
     # -- aperçu d'empilement rapide
-    def quick_stack_preview(self):
-        """Empile rapidement les brutes gardées de la série (réduites,
-        alignées sur les étoiles) pour juger la série avant Siril."""
+    def stack_candidates(self, what="l'aperçu"):
+        """Brutes gardées et alignées sur la référence, et toutes les brutes
+        alignées : ([(source, transformation)], [...], nombre non alignées),
+        ou None (message déjà affiché)."""
         if getattr(self, "planet", False):
             QMessageBox.information(
-                self, APP_NAME, "Série planétaire : l'aperçu d'empilement aligne "
-                "sur les étoiles. Pour les planètes, utilisez AutoStakkert!.")
-            return
+                self, APP_NAME, "Série planétaire : l'empilement aligne sur les "
+                "étoiles. Pour les vidéos de planètes, utilisez Traitement ▸ "
+                "Empiler une vidéo, ou AutoStakkert!.")
+            return None
         self.update_geometry(force=True)
         lights = [it for it in self.working_items() if self.item_type(it) == "light"]
         kept = [it for it in lights if not it.data(0, ROLE_REJ)]
@@ -8405,8 +8916,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, APP_NAME, "Il faut d'abord mesurer la série : les étoiles "
                 "servent à aligner les images. Attendez la fin des mesures, "
-                "puis relancez l'aperçu.")
-            return
+                f"puis relancez {what}.")
+            return None
+
         def usable(its):
             out = []
             for it in its:
@@ -8415,11 +8927,19 @@ class MainWindow(QMainWindow):
                     out.append((src, self.transforms.get(src)))
             return [x for x in self.light_order_pairs(out)]
         k_items, a_items = usable(kept), usable(lights)
-        skipped = len(kept) - len(k_items)
         if len(k_items) < 2:
             QMessageBox.information(self, APP_NAME, "Pas assez d'images gardées "
                                     "et alignées pour un empilement.")
+            return None
+        return k_items, a_items, len(kept) - len(k_items)
+
+    def quick_stack_preview(self):
+        """Empile rapidement les brutes gardées de la série (réduites,
+        alignées sur les étoiles) pour juger la série avant Siril."""
+        cand = self.stack_candidates()
+        if not cand:
             return
+        k_items, a_items, skipped = cand
         dlg = QDialog(self)
         dlg.setWindowTitle("Aperçu d'empilement rapide")
         form = QVBoxLayout(dlg)
@@ -8460,6 +8980,239 @@ class MainWindow(QMainWindow):
         exps = [((self.find_item(s).data(0, ROLE_META) or {}).get("exptime") or 0)
                 for s, _t in k_items]
         res["exposure"] = sum(exps)
+        self.show_quick_stack(res)
+
+    # -- empilement complet avec drizzle
+    def calibration_groups(self):
+        """Darks, flats, offsets et darks de flat gardés de la liste :
+        {type: [(source, pose)]}."""
+        groups = {}
+        for it in self.all_items():
+            kind = self.item_type(it)
+            if kind in ("dark", "flat", "bias", "darkflat") and not it.data(0, ROLE_REJ):
+                meta = it.data(0, ROLE_META) or {}
+                groups.setdefault(kind, []).append((it.data(0, ROLE_SRC), meta.get("exptime")))
+        return groups
+
+    def drizzle_dialog(self):
+        """Empile en pleine résolution toutes les brutes gardées et alignées,
+        avec drizzle (bayer ou mono), rejet des pixels aberrants et, si la
+        liste en contient, calibration par les darks, flats et offsets."""
+        cand = self.stack_candidates("l'empilement")
+        if not cand:
+            return
+        k_items, skipped = cand[0], cand[2]
+        try:
+            rdata, rheader, _ = read_source(self.ref)
+        except Exception as e:   # noqa: BLE001
+            QMessageBox.warning(self, APP_NAME, f"Référence illisible : {e}")
+            return
+        H, W = rdata.shape[:2]
+        bayer = str(rheader.get("BAYERPAT", "") or "").strip().upper()
+        is_cfa = rdata.ndim == 2 and bayer in BAYER_PATTERNS
+        color = is_cfa or rdata.ndim == 3
+        del rdata
+        exps = [((self.find_item(s).data(0, ROLE_META) or {}).get("exptime") or 0)
+                for s, _t in k_items]
+        light_exp = _median([e for e in exps if e]) if any(exps) else None
+        groups = self.calibration_groups()
+        st = settings()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Empiler les brutes avec drizzle")
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(
+            f"{len(k_items)} brute(s) gardée(s) et alignée(s) sur la référence"
+            + (f" ({skipped} non alignée(s) laissée(s) de côté)" if skipped else "")
+            + f", {W} × {H} pixels" + (f", matrice {bayer}" if is_cfa else "")
+            + ".\nChaque pixel des brutes est déposé, après alignement, sur une grille "
+            "plus fine : les petits décalages entre les poses (dithering, dérive, "
+            "rotation de champ du Dwarf) rendent la finesse que des pixels trop gros "
+            "ont perdue.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        form = QFormLayout()
+        scale_cb = QComboBox()
+        for v in DZ_SCALES:
+            scale_cb.addItem(f"× {fr(v, 1).replace(',0', '')}", v)
+        try:
+            scale_cb.setCurrentIndex(DZ_SCALES.index(float(st.value("drizzle/scale", 2.0))))
+        except ValueError:
+            scale_cb.setCurrentIndex(DZ_SCALES.index(2.0))
+        scale_cb.setToolTip("Agrandissement de l'image finale. × 2 convient aux images "
+                            "sous-échantillonnées (étoiles de 2 pixels ou moins, Dwarf 3, "
+                            "petites focales) ; × 1 garde la taille des brutes.")
+        form.addRow("Échelle :", scale_cb)
+        pf = QDoubleSpinBox()
+        pf.setRange(0.1, 1.0)
+        pf.setSingleStep(0.05)
+        pf.setDecimals(2)
+        pf.setValue(float(st.value("drizzle/pixfrac", 1.0)))
+        pf.setToolTip("Taille des gouttes (fraction d'un pixel). Plus petite : image un "
+                      "peu plus fine mais plus bruitée, et des trous si les brutes sont "
+                      "peu nombreuses ou peu décalées. 1 est le choix sûr ; 0,6 à 0,8 "
+                      "avec beaucoup de brutes bien décalées.")
+        form.addRow("Taille des gouttes (pixfrac) :", pf)
+        bayer_rb = QRadioButton("Drizzle bayer : chaque pixel nourrit sa couleur, sans débayérisation")
+        super_rb = QRadioButton("Super-pixel puis drizzle : jamais de trou, un peu moins fin")
+        if is_cfa:
+            (super_rb if setting_bool("drizzle/superpixel", False) else bayer_rb).setChecked(True)
+            cbox = QVBoxLayout()
+            cbox.addWidget(bayer_rb)
+            cbox.addWidget(super_rb)
+            wcol = QWidget()
+            wcol.setLayout(cbox)
+            cbox.setContentsMargins(0, 0, 0, 0)
+            form.addRow("Couleurs :", wcol)
+        rej = QCheckBox("Rejeter les pixels aberrants (traînées, rayons cosmiques, pixels chauds)")
+        rej.setChecked(setting_bool("drizzle/reject", True))
+        kappa = QDoubleSpinBox()
+        kappa.setRange(1.5, 6.0)
+        kappa.setSingleStep(0.25)
+        kappa.setDecimals(2)
+        kappa.setValue(float(st.value("drizzle/kappa", 3.0)))
+        kappa.setSuffix(" σ")
+        kappa.setToolTip("Écart au-delà duquel une valeur est rejetée. Le rejet demande "
+                         "deux passages sur les brutes, donc deux fois plus de temps.")
+        rrow = QHBoxLayout()
+        rrow.addWidget(rej)
+        rrow.addWidget(kappa)
+        rrow.addStretch(1)
+        if len(k_items) < DZ_MIN_REJECT:
+            rej.setChecked(False)
+            rej.setEnabled(False)
+            rej.setToolTip(f"Il faut au moins {DZ_MIN_REJECT} brutes.")
+        kappa.setEnabled(rej.isChecked())
+        rej.toggled.connect(kappa.setEnabled)
+        lay.addLayout(form)
+        lay.addLayout(rrow)
+        weight = QCheckBox("Pondérer les brutes par leur bruit (les poses voilées comptent moins)")
+        weight.setChecked(setting_bool("drizzle/weight", True))
+        lay.addWidget(weight)
+        n_dark = len(dz_matching_darks(groups.get("dark", []), light_exp))
+        parts = []
+        for key, name in (("dark", "dark"), ("flat", "flat"), ("bias", "offset"),
+                          ("darkflat", "dark de flat")):
+            n = len(groups.get(key, []))
+            if n:
+                txt = f"{n} {name}{'s' if n > 1 and key != 'darkflat' else ''}"
+                if key == "dark" and n_dark < n:
+                    txt += f" (dont {n_dark} de même pose que les brutes)"
+                parts.append(txt)
+        cal = QCheckBox("Calibrer avec les fichiers de la liste : "
+                        + (", ".join(parts) if parts else "aucun dark, flat ni offset"))
+        cal.setEnabled(bool(parts) and (is_cfa or not color))
+        cal.setChecked(cal.isEnabled() and setting_bool("drizzle/calibrate", True))
+        if not parts:
+            cal.setToolTip("Ajoutez les dossiers de darks et de flats de la séance "
+                           "pour qu'ils soient pris en compte.")
+        lay.addWidget(cal)
+        mem = QLabel()
+        mem.setWordWrap(True)
+        lay.addWidget(mem)
+
+        def update_mem():
+            s_ = scale_cb.currentData()
+            need = dz_memory((H, W), color, s_, rej.isChecked())
+            avail = available_memory()
+            txt = (f"Image finale : {int(round(W * s_))} × {int(round(H * s_))} pixels · "
+                   f"mémoire nécessaire ≈ {fr(need / 1e9, 1)} Go"
+                   + (f" (disponible : {fr(avail / 1e9, 1)} Go)" if avail else ""))
+            if avail and need > 0.85 * avail:
+                txt = ("<span style='color:#d33'>" + txt + " — trop juste : choisissez "
+                       "une échelle plus petite ou fermez d'autres programmes.</span>")
+            mem.setText(txt)
+        scale_cb.currentIndexChanged.connect(lambda *_a: update_mem())
+        rej.toggled.connect(lambda *_a: update_mem())
+        update_mem()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Empiler")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if not dlg.exec():
+            return
+        opts = {"scale": scale_cb.currentData(), "pixfrac": pf.value(),
+                "superpixel": is_cfa and super_rb.isChecked(),
+                "reject": rej.isChecked(), "kappa": kappa.value(),
+                "weight": weight.isChecked()}
+        st.setValue("drizzle/scale", opts["scale"])
+        st.setValue("drizzle/pixfrac", opts["pixfrac"])
+        st.setValue("drizzle/superpixel", bool(super_rb.isChecked()))
+        st.setValue("drizzle/reject", opts["reject"])
+        st.setValue("drizzle/kappa", opts["kappa"])
+        st.setValue("drizzle/weight", opts["weight"])
+        if cal.isEnabled():
+            st.setValue("drizzle/calibrate", cal.isChecked())
+        use_cal = cal.isEnabled() and cal.isChecked()
+        n_reads = (calibration_reads(groups, light_exp) if use_cal else 0) \
+            + len(k_items) * (2 if opts["reject"] else 1)
+        title = ("Empilement drizzle" + (" : calibration, puis" if use_cal else " :")
+                 + (" deux passages sur les brutes" if opts["reject"] else " un passage sur les brutes"))
+
+        def work(progress):
+            state = {"i": 0, "src": self.ref}
+
+            def tick(src):
+                state["src"] = src
+                if not progress(min(state["i"], n_reads - 1), src):
+                    raise Cancelled()
+                state["i"] += 1
+
+            def poll():
+                if not progress(min(max(state["i"] - 1, 0), n_reads - 1), state["src"]):
+                    raise Cancelled()
+            calib = (build_calibration(groups, (H, W), bayer if is_cfa else "",
+                                       light_exp, tick) if use_cal else None)
+            return drizzle_stack(k_items, self.ref, opts, calib, tick, poll)
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            res = self.run_with_progress(title, [self.ref] * max(1, n_reads), work)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not res:
+            return
+        res["exposure"] = sum(exps)
+        dz = res["drizzle"]
+        h_, w_ = res["stack"].shape[:2]
+        s_txt = fr(dz["scale"], 1).replace(",0", "")
+        info = [f"{res['n']} brutes empilées en pleine résolution, drizzle × {s_txt}, "
+                f"gouttes {fr(dz['pixfrac'], 2)}"
+                + (", drizzle bayer" if dz["cfa"] and not dz["superpixel"] else "")
+                + (", super-pixel" if dz["superpixel"] else "")
+                + (", pondérées par leur bruit" if dz["weight"] else "")
+                + f". Image finale : {w_} × {h_} pixels."]
+        if res.get("exposure"):
+            info.append(f"Temps de pose : {hm(res['exposure'])}.")
+        if dz["reject"]:
+            info.append(f"Pixels rejetés au-delà de {fr(dz['kappa'], 2)} σ (traînées, "
+                        f"rayons cosmiques, pixels chauds) : {fr(100 * res['rejected'], 2)} %.")
+        else:
+            info.append("Sans rejet des pixels aberrants.")
+        if res.get("calib_notes"):
+            info.append("Calibration : " + ", ".join(res["calib_notes"]) + ".")
+        else:
+            info.append("Sans calibration : le vignetage et les poussières restent ; les "
+                        "pixels chauds ne partent que si les brutes sont décalées.")
+        if dz["holes"] > 0.002:
+            info.append(f"{fr(100 * dz['holes'], 1)} % des pixels n'avaient reçu aucune goutte "
+                        "d'une couleur et ont été comblés par leurs voisins : augmentez "
+                        "la taille des gouttes, ou empilez davantage de brutes décalées.")
+        info.append("« Une seule image » montre la référence agrandie à la même échelle, "
+                    "pour juger du gain de finesse. L'empilement est linéaire : "
+                    "enregistrez-le en FITS pour le traiter dans Siril ou PixInsight.")
+        res.update({
+            "title": "Empilement drizzle", "info": info,
+            "filename": f"empilement_drizzle_x{s_txt.replace(',', '.')}.fit",
+            "history": (f"AstroCheck : empilement drizzle x{dz['scale']:g}, pixfrac "
+                        f"{dz['pixfrac']:g}, {res['n']} brutes"),
+            "fits_extra": {
+                "EXPTIME": (float(res["exposure"] or 0), "[s] total exposure"),
+                "DRIZSCAL": (float(dz["scale"]), "drizzle output scale"),
+                "DRIZPIXF": (float(dz["pixfrac"]), "drizzle pixfrac"),
+            },
+        })
         self.show_quick_stack(res)
 
     def run_plate_solve(self, res, parent=None):
@@ -8547,8 +9300,9 @@ class MainWindow(QMainWindow):
         return [(s, d[s]) for s in order]
 
     def show_quick_stack(self, res):
+        """Fenêtre de résultat de l'aperçu rapide et de l'empilement drizzle."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("Aperçu d'empilement rapide")
+        dlg.setWindowTitle(res.get("title", "Aperçu d'empilement rapide"))
         lay = QVBoxLayout(dlg)
         view = QLabel()
         view.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -8585,21 +9339,23 @@ class MainWindow(QMainWindow):
             buttons.append(b)
         row.addStretch(1)
         lay.addLayout(row)
-        info = []
-        if res.get("gain"):
-            info.append(f"Bruit du fond divisé par {res['gain']:.1f} par rapport à une "
-                        f"image seule (au mieux √{res['n']} = {np.sqrt(res['n']):.1f}).")
-        if res.get("exposure"):
-            info.append(f"Temps de pose gardé : {hm(res['exposure'])}.")
-        info.append(f"Pixels rejetés (traînées, rayons cosmiques, pixels chauds) : "
-                    f"{100 * res['rejected']:.2f} %.")
-        if res.get("all") and res["all"].get("gain") and res.get("gain"):
-            info.append("Avec les rejetées : bruit divisé par "
-                        f"{res['all']['gain']:.1f}. Comparez la finesse des étoiles "
-                        "et le fond : si l'image est plus douce ou plus sale, le tri "
-                        "était justifié.")
-        info.append("Aperçu réduit et sans calibration (darks, flats) : il sert à "
-                    "juger la série, pas à remplacer l'empilement dans Siril.")
+        info = list(res.get("info") or [])
+        if not info:                                 # aperçu rapide
+            if res.get("gain"):
+                info.append(f"Bruit du fond divisé par {res['gain']:.1f} par rapport à une "
+                            f"image seule (au mieux √{res['n']} = {np.sqrt(res['n']):.1f}).")
+            if res.get("exposure"):
+                info.append(f"Temps de pose gardé : {hm(res['exposure'])}.")
+            info.append(f"Pixels rejetés (traînées, rayons cosmiques, pixels chauds) : "
+                        f"{100 * res['rejected']:.2f} %.")
+            if res.get("all") and res["all"].get("gain") and res.get("gain"):
+                info.append("Avec les rejetées : bruit divisé par "
+                            f"{res['all']['gain']:.1f}. Comparez la finesse des étoiles "
+                            "et le fond : si l'image est plus douce ou plus sale, le tri "
+                            "était justifié.")
+            info.append("Aperçu réduit et sans calibration (darks, flats) : il sert à "
+                        "juger la série, pas à remplacer l'empilement dans Siril. Pour "
+                        "un empilement complet : Traitement ▸ Empiler les brutes avec drizzle.")
         txt = QLabel("\n".join(info))
         txt.setWordWrap(True)
         lay.addWidget(txt)
@@ -8608,8 +9364,9 @@ class MainWindow(QMainWindow):
 
         def do_save():
             first = res["header"]
-            default = os.path.join(os.path.dirname(self.ref[0]), "apercu_empilement.fit")
-            path, _f = QFileDialog.getSaveFileName(dlg, "Enregistrer l'aperçu",
+            default = os.path.join(os.path.dirname(self.ref[0]),
+                                   res.get("filename", "apercu_empilement.fit"))
+            path, _f = QFileDialog.getSaveFileName(dlg, "Enregistrer l'empilement",
                                                    default, "FITS (*.fit *.fits)")
             if not path:
                 return
@@ -8628,10 +9385,12 @@ class MainWindow(QMainWindow):
                 for i in range(2):
                     for j in range(2):
                         hdr[f"CD{i + 1}_{j + 1}"] = float(wcs["cd"][i, j])
-            hdr["HISTORY"] = "AstroCheck : apercu d'empilement rapide (reduit)"
+            for k, v in (res.get("fits_extra") or {}).items():
+                hdr[k] = v
+            hdr["HISTORY"] = to_ascii(res.get("history", "AstroCheck : apercu d'empilement rapide (reduit)"))
             fits.PrimaryHDU(data=np.ascontiguousarray(arr, dtype=np.float32),
                             header=hdr).writeto(path, overwrite=True)
-            self.statusBar().showMessage(f"Aperçu enregistré : {path}", 8000)
+            self.statusBar().showMessage(f"Empilement enregistré : {path}", 8000)
         save.clicked.connect(do_save)
         close = QPushButton("Fermer")
         close.clicked.connect(dlg.accept)

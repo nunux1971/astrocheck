@@ -374,7 +374,26 @@ sudo apt install ./astap_amd64.deb ./d50_star_database.deb
 
 Sans ASTAP, AstroCheck essaie Siril (`siril-cli`), qui résout avec un catalogue en ligne. Le centre approximatif (mots-clés RA et DEC) et l'échelle (focale et taille des pixels) de l'en-tête accélèrent la recherche : le Dwarf 3 et l'ASIAIR les écrivent.
 
-C'est un aperçu, sans darks ni flats et en taille réduite : l'empilement final se fait toujours dans Siril. Les séries planétaires (vidéos) ne sont pas concernées : elles s'alignent sur la planète, pas sur les étoiles.
+C'est un aperçu, sans darks ni flats et en taille réduite. Pour l'empilement complet, voyez la section suivante, ou Siril. Les séries planétaires (vidéos) ne sont pas concernées : elles s'alignent sur la planète, pas sur les étoiles.
+
+### Empiler les brutes avec drizzle
+
+**Traitement ▸ Empiler les brutes avec drizzle…** (Ctrl+Maj+D) empile **toutes** les brutes gardées et alignées de la série affichée, en pleine résolution. Chaque pixel d'une brute devient une « goutte » posée, après alignement sur les étoiles, sur une grille plus fine que celle du capteur. Comme les poses sont légèrement décalées les unes des autres (dithering de l'ASIAIR, dérive, rotation de champ du Dwarf 3 en alt-azimutal), les gouttes tombent à des endroits différents et l'image retrouve une partie de la finesse que des pixels trop gros avaient perdue.
+
+Les réglages :
+
+- **Échelle** (× 1, × 1,5, × 2, × 3) : agrandissement de l'image finale. × 2 convient aux images sous-échantillonnées, quand les étoiles ne font que 2 pixels environ (Dwarf 3, petites focales) ; × 1 garde la taille des brutes.
+- **Taille des gouttes** (pixfrac) : 1 est le choix sûr. Plus petite (0,6 à 0,8), l'image gagne encore un peu en finesse mais devient plus bruitée, et il faut beaucoup de brutes bien décalées pour éviter les trous.
+- **Couleurs** (capteur couleur) : le **drizzle bayer** dépose chaque pixel dans sa propre couleur, sans débayérisation, donc sans couleurs interpolées ; le **super-pixel** débayérise d'abord chaque brute (moitié de taille) : jamais de trou, un peu moins fin.
+- **Rejet des pixels aberrants** : traînées de satellites et d'avions, rayons cosmiques, pixels chauds sont écartés au-delà de 3 σ (réglable). Il faut au moins 5 brutes, et le rejet demande deux passages sur les brutes. En couleur, les trois canaux sont jugés ensemble à chaque pixel, pour que chaque pixel s'appuie sur toutes les brutes et que le cœur des étoiles ne soit jamais rogné.
+- **Pondération par le bruit** : une brute voilée ou plus bruitée compte moins.
+- **Calibration** : si la liste contient des darks, flats, offsets ou darks de flat, ils sont combinés en masters (moyenne avec rejet) et appliqués à chaque brute : dark retiré (ou offset si les darks n'ont pas la même pose), division par le flat normalisé couleur par couleur, ce qui corrige vignetage et poussières sans changer l'équilibre des couleurs.
+
+La fenêtre indique la taille de l'image finale et la mémoire nécessaire : en × 2, une brute de 3840 × 2160 pixels (Dwarf 3) donne une image de 7680 × 4320 pixels et demande environ 3 Go. Les calculs utilisent tous les cœurs du processeur ; comptez quelques secondes par brute et par passage.
+
+Le résultat s'ouvre dans la même fenêtre que l'aperçu rapide : **Une seule image** montre la référence agrandie à la même échelle, pour juger du gain de finesse ; la **résolution astrométrique** fonctionne de la même façon ; **Enregistrer l'empilement (FITS)…** écrit l'image linéaire en 32 bits, avec le temps de pose total et les réglages du drizzle dans l'en-tête, prête pour le retrait du gradient, l'étalonnage des couleurs et l'étirement dans Siril ou PixInsight.
+
+Les pixels qu'aucune goutte d'une couleur n'a atteints sont comblés par leurs voisins ; la fenêtre le signale quand il y en a plus de quelques-uns pour mille. Sans dithering ni dérive, le drizzle n'apporte rien : restez alors en × 1.
 
 ### Journal des cibles pour AstroPlan
 
@@ -578,6 +597,7 @@ Cette commande sert aussi à extraire quelques images d'un SER, ou à le convert
 | Ctrl+B | Bilan de la séance |
 | Ctrl+Maj+F | Contrôle des flats |
 | Ctrl+Maj+A | Aperçu d'empilement rapide |
+| Ctrl+Maj+D | Empiler les brutes avec drizzle |
 | Ctrl+J | Mettre à jour le journal AstroPlan |
 | Molette | Zoomer / dézoomer |
 | Ctrl+R | Analyser et classer les images |
